@@ -1,6 +1,5 @@
 """Opt-in experimental FP8 AR linear layers; NAR always restores exact BF16.
 
-No quantized quality or speed claim is implied by enabling this module.
 FP8 kernels require NVIDIA compute capability 8.9 or newer. Original weights
 remain in CPU memory, outside the registered module tree, for exact restore.
 """
@@ -49,9 +48,6 @@ class FP8Linear(nn.Module):
             output = output[0]
         return output[:count].reshape(*shape[:-1], self.out_features)
 
-    def dequantized_weight(self):
-        """Diagnostic/reference helper; normal inference uses scaled_mm."""
-        return self.weight.float() * self.weight_scale
 
 
 def _replace(model, name, replacement):

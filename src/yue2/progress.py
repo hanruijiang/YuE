@@ -290,17 +290,6 @@ class _Stage:
             if self._owner._active[-1] is self:
                 self._owner._render(self, _clock())
 
-    def set_total(self, total):
-        """Set the real work total; ``None`` restores an unknown total."""
-        total = None if total is None else _count(total, "total")
-        with self._owner._lock:
-            self._check_active()
-            if self._finished:
-                return
-            self.total = total
-            if self._owner._active[-1] is self:
-                self._owner._render(self, _clock())
-
     def advance(self, count=1):
         """Add completed work without a read/update race between callbacks."""
         count = _count(count, "count")

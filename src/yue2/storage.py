@@ -36,15 +36,30 @@ def write_json(path, value):
         Path(stream.name).unlink(missing_ok=True)
 
 
-# Explicit public model files. Extra reports, caches and arbitrary code are not exported.
+# Model repository assets. The published YuE2 preset is retained for export;
+# runtime defaults come from --config, pipeline.json, or GenerationConfig().
 MODEL_FILES = frozenset({
     "config.json", "generation_config.json", "yue2_generation_config.json",
     "weights_manifest.json", "model.safetensors", "model.safetensors.index.json",
-    "qwen.tiktoken", "modeling_yue2.py", "modeling_vae.py",
+    "qwen.tiktoken",
     "LICENSE", "THIRD_PARTY_NOTICES.md",
 })
 MODEL_LICENSES = frozenset({"stable-audio-tools-MIT.txt", "SnakeBeta-NVIDIA-MIT.txt"})
 SHARD_NAME = re.compile(r"model-[0-9]{5}-of-[0-9]{5}\.safetensors")
+
+
+def pipeline_sources(model, vae):
+    """Resolve the references in a relocated pipeline without initializing a device."""
+    from .protocol import GenerationConfig
+    parent = Path(model).expanduser()
+    saved = parent / "pipeline.json"
+    if saved.is_file():
+        metadata = json.loads(saved.read_text(encoding="utf-8"))
+        model = parent / metadata["model"]
+        if vae is None:
+            vae = parent / metadata["vae"]
+        return model, vae, GenerationConfig.from_dict(metadata["generation_config"])
+    return model, "m-a-p/YuE2-Vae" if vae is None else vae, None
 
 
 def resolve_model(model, revision=None, local_files_only=False, token=None, cache_dir=None, **kwargs):
@@ -83,7 +98,7 @@ def copy_model_files(source, destination):
     else:
         raise ValueError("Unsupported model configuration")
     weights = model_identity(source)
-    names = set(MODEL_FILES) - {"config.json", "modeling_yue2.py", "modeling_vae.py", "weights_manifest.json"}
+    names = set(MODEL_FILES) - {"config.json", "weights_manifest.json"}
     names.update(name for name in weights["files"] if SHARD_NAME.fullmatch(name))
     if set(weights["files"]) - names:
         raise ValueError("Unexpected model weight filename")
@@ -102,7 +117,7 @@ def copy_model_files(source, destination):
                 write_json(destination / name, value)
             else:
                 shutil.copyfile(file, destination / name)
-    # Use the installed, reviewed implementation instead of arbitrary source-folder code.
+    # Include the runtime implementation in portable exports.
     shutil.copyfile(Path(__file__).with_name(code_name), destination / code_name)
     for name in sorted(MODEL_LICENSES):
         file = source / "licenses" / name
@@ -132,7 +147,13 @@ def model_identity(path, verify=True):
         entries[file.name] = {"sha256": digest, "bytes": file.stat().st_size}
     if expected is not None and set(entries) != set(expected.get("files", {})):
         raise ValueError("Weight manifest has missing or unexpected shards")
-    return {"files": entries, "config_sha256": sha256_file(path / "config.json")}
+    result = {"files": entries, "config_sha256": sha256_file(path / "config.json")}
+    # Include inference configuration and tokenizer in the model identity.
+    for name, key in (("qwen.tiktoken", "tokenizer_sha256"),
+                      ("model.safetensors.index.json", "index_sha256")):
+        if (path / name).is_file():
+            result[key] = sha256_file(path / name)
+    return result
 
 
 def collect_hashes(directory, exclude=("result.json",)):

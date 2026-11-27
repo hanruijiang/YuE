@@ -89,9 +89,8 @@ def test_real_total_can_arrive_after_stage_starts(monkeypatch):
     with Progress(stream=stream).stage("Synthesizing", unit="steps") as stage:
         now[0] = 5.0
         stage.update(8, total=32)
-        stage.set_total(64)
         now[0] = 10.0
-        stage.update(16)
+        stage.update(16, total=64)
         stage.advance(16)
     output = stream.getvalue()
     assert "8/32 steps (25%)" in output
@@ -199,8 +198,7 @@ def test_invalid_values_fail_without_spawning_threads():
     for total in [-1, 1.5, True]:
         with pytest.raises(ValueError):
             reporter.stage("Invalid", total=total)
-    with reporter.stage("Valid", total=0) as stage:
-        stage.set_total(None)
+    with reporter.stage("Valid") as stage:
         stage.advance(2)
         with pytest.raises(ValueError):
             stage.update(1)

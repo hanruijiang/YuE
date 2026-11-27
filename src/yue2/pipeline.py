@@ -10,10 +10,10 @@ import time
 import numpy as np
 import torch
 
-from .protocol import SongRequest, GenerationConfig, Sampling, make_request, token_prefixes, negative_prefix, CODEC_OFFSET, resolve_sampling
-from .storage import resolve_model, model_identity, identity, write_json, collect_hashes, sha256_file, copy_model_files
+from .protocol import SongRequest, GenerationConfig, make_request, token_prefixes, negative_prefix, CODEC_OFFSET, resolve_sampling
+from .storage import resolve_model, model_identity, identity, write_json, collect_hashes, sha256_file, copy_model_files, pipeline_sources
 from .tokenization_yue2 import YuE2TextTokenizer
-from .sampling import generate_tokens, synchronize
+from .sampling import generate_tokens
 from .progress import Progress
 from .devices import resolve_device, empty_cache
 from .placement import activate_phase
@@ -142,6 +142,33 @@ class SongResult:
         return result
 
 
+def _write_pipeline(directory, model_dir, vae_dir, generation_config, weights):
+    for name, source in (("YuE2-3B", model_dir), ("YuE2-Vae", vae_dir)):
+        destination = directory / name
+        if destination.resolve() == source.resolve():
+            continue
+        copy_model_files(source, destination)
+    write_json(directory / "pipeline.json", {"model": "YuE2-3B", "vae": "YuE2-Vae",
+               "generation_config": generation_config.to_dict(), "source_weights": weights})
+
+
+def export_pipeline(directory, model, *, vae, revision=None, vae_revision=None,
+                    local_files_only=False, generation_config=None, progress=True):
+    """Export verified model files without selecting an accelerator or loading weights."""
+    directory = Path(directory)
+    if directory.exists() and any(directory.iterdir()):
+        raise FileExistsError("save_pretrained needs an empty pipeline destination")
+    model, vae, saved_config = pipeline_sources(model, vae)
+    config = generation_config or saved_config or GenerationConfig()
+    with Progress(enabled=progress).stage("Resolving model files"):
+        model_dir = resolve_model(model, revision=revision, local_files_only=local_files_only)
+        vae_dir = resolve_model(vae, revision=vae_revision, local_files_only=local_files_only)
+    with Progress(enabled=progress).stage("Verifying model files"):
+        YuE2TextTokenizer(model_dir / "qwen.tiktoken")
+        weights = {"mot": model_identity(model_dir), "vae": model_identity(vae_dir)}
+    _write_pipeline(directory, model_dir, vae_dir, config, weights)
+
+
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
@@ -149,14 +176,12 @@ class YuE2Pipeline:
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
-        if backend not in {"torch", "torch-eager", "vllm"}:
-            raise ValueError("backend must be torch, torch-eager, or vllm")
+        if backend not in {"torch", "torch-eager"}:
+            raise ValueError("backend must be torch or torch-eager")
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
         if not math.isfinite(memory_budget_gib) or not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be finite and positive")
-        if low_vram and backend == "vllm":
-            raise ValueError("low_vram requires backend='torch' or 'torch-eager'")
         self.low_vram = low_vram
         self.device = resolve_device(device)
         torch.backends.cudnn.benchmark = False
@@ -165,7 +190,9 @@ class YuE2Pipeline:
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         torch.set_float32_matmul_precision("highest")
-        self.model_dir, self.vae_dir = Path(model_dir), Path(vae_dir)
+        self.model_dir = Path(model_dir)
+        self.vae_dir = Path(vae_dir) if vae_dir is not None else None
+        self._deferred_vae = None
         self.backend, self.quantization = backend, quantization
         self.memory_budget_gib = float(memory_budget_gib)
         self.vae_core_frames = vae_core_frames if vae_core_frames is not None else (512 if memory_budget_gib <= 12 else 1024)
@@ -173,8 +200,9 @@ class YuE2Pipeline:
         self.generation_config = generation_config or GenerationConfig()
         self.tokenizer = YuE2TextTokenizer(self.model_dir / "qwen.tiktoken")
         with self._status("Verifying model files"):
-            self.weights = {"mot": model_identity(self.model_dir, verify_hashes),
-                            "vae": model_identity(self.vae_dir, verify_hashes)}
+            self.weights = {"mot": model_identity(self.model_dir, verify_hashes)}
+            if self.vae_dir is not None:
+                self.weights["vae"] = model_identity(self.vae_dir, verify_hashes)
         self.runtime_sha256 = identity({p.name: sha256_file(p) for p in sorted(Path(__file__).parent.glob("*.py"))})
         self._model, self._vae = None, None
         self.load_timing = {}
@@ -188,28 +216,41 @@ class YuE2Pipeline:
             torch.cuda.set_per_process_memory_fraction(min(budget / total, 1), self.device)
 
     @classmethod
-    def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
+    def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae=None,
                         revision=None, vae_revision=None, local_files_only=False,
-                        token=None, cache_dir=None, progress=True, **kwargs):
+                        token=None, cache_dir=None, progress=True, defer_vae=False, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         start = time.perf_counter()
-        saved = Path(model) / "pipeline.json"
-        if saved.is_file():
-            metadata = json.loads(saved.read_text(encoding="utf-8"))
-            parent = Path(model)
-            model = parent / metadata["model"]
-            if vae == "m-a-p/YuE2-Vae":
-                vae = parent / metadata["vae"]
-            kwargs.setdefault("generation_config", GenerationConfig.from_dict(metadata["generation_config"]))
+        model, vae, saved_config = pipeline_sources(model, vae)
+        if saved_config is not None:
+            kwargs.setdefault("generation_config", saved_config)
         hub = dict(local_files_only=local_files_only, token=token, cache_dir=cache_dir)
         with Progress(enabled=progress).stage("Resolving model files"):
             model_path = resolve_model(model, revision=revision, **hub)
-            vae_path = resolve_model(vae, revision=vae_revision, **hub)
+            vae_path = None if defer_vae else resolve_model(vae, revision=vae_revision, **hub)
         result = cls(model_path, vae_path, progress=progress, **kwargs)
+        if defer_vae:
+            result._deferred_vae = (vae, vae_revision, hub, kwargs.get("verify_hashes", True))
         result.load_timing["resolve_and_integrity_seconds"] = time.perf_counter() - start
         return result
+
+    def _ensure_vae(self):
+        """Resolve and verify deferred decoder files before audio generation or export."""
+        deferred = getattr(self, "_deferred_vae", None)
+        if deferred is None:
+            return
+        vae, revision, hub, verify = deferred
+        start = time.perf_counter()
+        with self._status("Resolving audio decoder files"):
+            path = resolve_model(vae, revision=revision, **hub)
+        with self._status("Verifying audio decoder files"):
+            weights = model_identity(path, verify)
+        self.vae_dir = path
+        self.weights["vae"] = weights
+        self._deferred_vae = None
+        self.load_timing["resolve_and_integrity_seconds"] += time.perf_counter() - start
 
     @contextmanager
     def _status(self, label, *, total=None, unit=None):
@@ -222,13 +263,9 @@ class YuE2Pipeline:
         directory = Path(directory)
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError("save_pretrained needs an empty pipeline destination")
-        for name, source in (("YuE2-3B", self.model_dir), ("YuE2-Vae", self.vae_dir)):
-            destination = directory / name
-            if destination.resolve() == source.resolve():
-                continue
-            copy_model_files(source, destination)
-        write_json(directory / "pipeline.json", {"model": "YuE2-3B", "vae": "YuE2-Vae",
-                   "generation_config": self.generation_config.to_dict(), "source_weights": self.weights})
+        self._ensure_vae()
+        _write_pipeline(directory, self.model_dir, self.vae_dir,
+                        self.generation_config, self.weights)
 
     def _load_model(self, for_nar=False):
         loading = self._model is None or next(self._model.parameters()).device != self.device
@@ -238,7 +275,7 @@ class YuE2Pipeline:
                     from .modeling_yue2 import YuE2ForCausalLM
                     start = time.perf_counter()
                     self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
-                                  torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+                                  dtype=torch.bfloat16).eval()
                     self.load_timing["mot_load_seconds"] = time.perf_counter() - start
                 if for_nar and getattr(self._model, "_yue2_fp8_originals", None):
                     from .quantization import restore_ar
@@ -263,7 +300,7 @@ class YuE2Pipeline:
         return self._model
 
     def _generate(self, prefix, sampling, seed, phase, **kwargs):
-        model = self._load_model() if self.backend != "vllm" else None
+        model = self._load_model()
         callback = kwargs.pop("on_token", None)
         label = "Planning score" if phase == "abc" else "Generating song"
         with self._status(label, unit="tokens") as status:
@@ -274,12 +311,9 @@ class YuE2Pipeline:
                 if callback is not None:
                     callback(token_phase, token)
             observed = on_output if self.progress else callback
-            if self.backend == "vllm":
-                from .fast import generate_vllm
-                result = generate_vllm(self, prefix, sampling, seed, phase, on_token=observed, **kwargs)
-            else:
-                result = generate_tokens(model, prefix, sampling, seed, phase,
-                                         use_cuda_graph=self.backend != "torch-eager", on_token=observed, **kwargs)
+            result = generate_tokens(model, prefix, sampling, seed, phase,
+                                     use_cuda_graph=self.backend != "torch-eager",
+                                     use_compile=self.backend != "torch-eager", on_token=observed, **kwargs)
             if result[2]:
                 status.finish(status="truncated")
             return result
@@ -317,9 +351,6 @@ class YuE2Pipeline:
     def synthesize(self, semantic, *, cancelled=None, on_progress=None):
         """Synthesize latents; ``on_progress(completed, total)`` reports ODE steps."""
         from .nar import synthesize
-        if self.backend == "vllm":
-            from .fast import close_vllm
-            close_vllm(self)
         if not isinstance(semantic, SemanticResult):
             raise TypeError("Pass the SemanticResult returned by generate_semantic()")
         if token_prefixes(semantic.plan.request, self.tokenizer, semantic.plan.abc_ids) != semantic.plan.prefix:
@@ -340,9 +371,6 @@ class YuE2Pipeline:
             return result.detach().float().cpu().numpy()
 
     def close(self):
-        if self.backend == "vllm":
-            from .fast import close_vllm
-            close_vllm(self)
         self._model, self._vae = None, None
         empty_cache(self.device)
 
@@ -370,6 +398,7 @@ class YuE2Pipeline:
                 if vae is not None:
                     model = YuE2VAE.from_pretrained(vae, decoder_only=True, device="cpu")
                 else:
+                    self._ensure_vae()
                     if self._vae is None:
                         self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True, device="cpu",
                                                             local_files_only=True)
@@ -389,7 +418,7 @@ class YuE2Pipeline:
                         if on_progress is not None:
                             on_progress(1, 1)
                     else:
-                        audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=16,
+                        audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=None,
                                                    output_device="cpu",
                                                    on_progress=report if (self.progress or on_progress is not None) else None)
                 if not torch.isfinite(audio).all():
@@ -401,6 +430,11 @@ class YuE2Pipeline:
             empty_cache(self.device)
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
+        self._ensure_vae()
+        from .modeling_vae import YuE2VAEConfig
+        vae_config = YuE2VAEConfig.from_pretrained(self.vae_dir, local_files_only=True)
+        if vae_config.latent_dim != 64:
+            raise ValueError("Song generation requires a 64-channel VAE")
         config = self.generation_config.to_dict()
         for key, sampling in (("abc", abc_sampling), ("semantic", semantic_sampling)):
             if sampling is not None:
@@ -414,7 +448,8 @@ class YuE2Pipeline:
                 "cfg_negative": "instruction_only" if request.cot == "off" else "same_instruction_and_exact_abc",
                 "backend": self.backend, "quantization": self.quantization,
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
-                "vae_core_frames": self.vae_core_frames, "vae_halo_frames": 16,
+                "vae_core_frames": self.vae_core_frames, "vae_halo_frames": vae_config.decode_halo_frames,
+                "sample_rate": vae_config.sample_rate,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
                 "offload_ar": self.offload_ar, "low_vram": self.low_vram, "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),
@@ -442,6 +477,7 @@ class YuE2Pipeline:
         timing = {"abc": plan.timing, "semantic": semantic.timing, "nar_seconds": nar_seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
                   "e2e_seconds": time.perf_counter() - start}
-        Progress(enabled=self.progress).complete(len(audio) / 48000, timing["e2e_seconds"],
+        sample_rate = config["sample_rate"]
+        Progress(enabled=self.progress).complete(len(audio) / sample_rate, timing["e2e_seconds"],
                                                 truncated=plan.truncated or semantic.truncated)
-        return SongResult(audio, 48000, semantic, latents, config, self.weights, timing, request_id)
+        return SongResult(audio, sample_rate, semantic, latents, config, self.weights, timing, request_id)

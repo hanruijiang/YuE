@@ -534,6 +534,11 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def _shift_t_value(self, t_value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        t_sig = torch.sigmoid(torch.tensor(t_value, dtype=dtype, device=device))
+        shift = self.config.timestep_shift
+        return shift * t_sig / (1 + (shift - 1) * t_sig)
+
     # ── AR forward (standard causal LM, KV cached) ───────────────────
 
     def forward(
@@ -543,15 +548,12 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if labels is not None and (not isinstance(logits_to_keep, int) or logits_to_keep != 0):
-            raise ValueError("Loss computation requires logits_to_keep=0")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Supply exactly one of input_ids or inputs_embeds")
         use_cache = use_cache if use_cache is not None else getattr(self.config, "use_cache", True)
@@ -607,20 +609,12 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
             selected = hidden_states[:, -logits_to_keep:, :] if logits_to_keep else hidden_states
         else:
             selected = hidden_states[:, logits_to_keep.to(device), :]
-        if labels is not None and selected.shape[1] != hidden_states.shape[1]:
-            raise ValueError("Loss computation requires logits_to_keep=0")
         logits = self.lm_head(selected)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
             output = (logits, past_key_values) if use_cache else (logits,)
-            return ((loss,) + output) if loss is not None else output
-        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values if use_cache else None)
+            return output
+        return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values if use_cache else None)
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None,
@@ -651,108 +645,7 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
             "logits_to_keep": kwargs.get("logits_to_keep", 1),
         }
 
-    # ── NAR velocity (flow matching, no KV cache) ────────────────────
 
-    def _shift_t_value(self, t_value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        t_sig = torch.sigmoid(torch.tensor(t_value, dtype=dtype, device=device))
-        shift = self.config.timestep_shift
-        return shift * t_sig / (1 + (shift - 1) * t_sig)
-
-    @torch.no_grad()
-    def nar_velocity(
-        self,
-        tokens: torch.LongTensor,
-        ar_mask: torch.BoolTensor,
-        nar_mask: torch.BoolTensor,
-        nar_content_mask: torch.BoolTensor,
-        x_t: torch.Tensor,
-        t_value: float,
-        nar_cond_end: int = 0,
-    ) -> torch.Tensor:
-        """Compute v_theta(x_t, t) — flow-matching velocity field.
-
-        Args:
-            tokens: [1, S] full sequence (AR + NAR tokens)
-            ar_mask: [1, S] True for AR positions
-            nar_mask: [1, S] True for NAR positions
-            nar_content_mask: [1, S] True for actual latent positions (not LATENT_START/END)
-            x_t: [T_lat, D] current ODE state
-            t_value: raw timestep (will be sigmoid-shifted)
-            nar_cond_end: if > 0, NAR only sees positions < nar_cond_end (text-only mode)
-        Returns:
-            v_pred: [T_lat, D] predicted velocity
-        """
-        device = tokens.device
-        dtype = next(self.parameters()).dtype
-        B, S = tokens.shape
-
-        # 1. Token embeddings
-        token_emb = self.model.embed_tokens(tokens)  # [B, S, H]
-
-        # 2. Build latent hidden for ALL NAR positions (START + content + END)
-        # Training injects vae2llm(x_t) + time_emb + pos_emb at ALL NAR positions,
-        # including LATENT_START (clean=0) and LATENT_END (clean=0).
-        # NAR position IDs via cumsum: START=0, content=[1..T_lat], END=T_lat+1.
-        t_shifted = self._shift_t_value(t_value, device, dtype)
-        T_lat = x_t.shape[0]
-
-        nar_indices = nar_mask[0].nonzero(as_tuple=True)[0]  # all NAR positions
-        content_indices = nar_content_mask[0].nonzero(as_tuple=True)[0]
-        N_nar = nar_indices.shape[0]  # START + T_lat + END
-
-        # Build x_t for all NAR positions: zeros for START/END, actual x_t for content
-        x_nar = torch.zeros(N_nar, x_t.shape[1], device=device, dtype=dtype)
-        x_nar[1:1 + T_lat] = x_t.to(dtype)  # content frames at positions [1, T_lat]
-
-        latent_hidden_nar = self.vae2llm(x_nar.unsqueeze(0))  # [1, N_nar, H]
-
-        # Timestep embedding (same t for all NAR positions)
-        time_emb = self.time_embedder(t_shifted.expand(N_nar)).unsqueeze(0)
-        latent_hidden_nar = latent_hidden_nar + time_emb
-
-        # Position embedding: cumsum-style [0, 1, 2, ..., N_nar-1]
-        pos_ids = torch.arange(N_nar, device=device).clamp(max=self.config.max_latent_frames - 1)
-        pos_emb = self.latent_pos_embed(pos_ids).unsqueeze(0)
-        latent_hidden_nar = latent_hidden_nar + pos_emb
-
-        # Inject at ALL NAR positions (matching training's torch.where)
-        token_emb[0, nar_indices] = latent_hidden_nar[0]
-
-        # 3. Build hybrid attention mask [B, 1, S, S]
-        # AR→AR: causal, NAR→AR: full, NAR→NAR: bidirectional, AR→NAR: blocked
-        ar_q = ar_mask.unsqueeze(2).float()   # [B, S, 1]
-        ar_k = ar_mask.unsqueeze(1).float()   # [B, 1, S]
-        nar_q = nar_mask.unsqueeze(2).float()
-        nar_k = nar_mask.unsqueeze(1).float()
-        causal = torch.tril(torch.ones(S, S, device=device))
-
-        if nar_cond_end > 0:
-            # Codec dropout: NAR only sees positions < nar_cond_end (text) + NAR
-            text_k = torch.zeros(1, 1, S, device=device)
-            text_k[0, 0, :nar_cond_end] = 1.0
-            mask = (ar_q * ar_k * causal) + (nar_q * text_k) + (nar_q * nar_k)
-        else:
-            mask = (ar_q * ar_k * causal) + (nar_q * ar_k) + (nar_q * nar_k)
-        # Convert to additive: 0 → attend, -inf → block
-        attn_mask = mask.unsqueeze(1)  # [B, 1, S, S]
-        attn_mask = attn_mask.masked_fill(attn_mask == 0, float("-inf")).masked_fill(attn_mask > 0, 0.0)
-
-        # 4. Position IDs + RoPE
-        position_ids = torch.arange(S, device=device).unsqueeze(0)
-
-        # 5. Forward through decoder (with MoT routing)
-        ar_mask_bt = ar_mask  # [B, S] bool for MoT routing
-        hidden_states, _ = self.model(
-            inputs_embeds=token_emb, position_ids=position_ids,
-            use_cache=False, attention_mask=attn_mask, ar_mask=ar_mask_bt,
-        )
-
-        # 6. NAR head at content positions
-        nar_pred = self.llm2vae(hidden_states)  # [B, S, D]
-        v_pred = nar_pred[0, content_indices]  # [T_lat, D]
-        return v_pred
-
-# Keep custom code + auto_map when a local user calls save_pretrained as well
-# as when the release builder creates a Hub repository.
+# Include the model implementation in Hugging Face exports.
 YuE2Config.register_for_auto_class()
 YuE2ForCausalLM.register_for_auto_class("AutoModelForCausalLM")

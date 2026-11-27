@@ -15,13 +15,21 @@ def kit_root():
     return Path(os.environ.get("YUE2_KIT", Path(__file__).resolve().parents[2]))
 
 
+def resolve_vae_path(value):
+    if value is not None and value not in {"standard", "legacy"}:
+        return value
+    name = "YuE2-Vae-legacy" if value == "legacy" else "YuE2-Vae"
+    local = kit_root() / "models" / name
+    return str(local) if local.exists() else f"m-a-p/{name}"
+
+
 def model_paths(args):
-    root = kit_root()
-    local_model = root / "models/YuE2-3B"
-    local_vae = root / "models" / ("YuE2-Vae-legacy" if args.vae == "legacy" else "YuE2-Vae")
+    local_model = kit_root() / "models/YuE2-3B"
     model = args.model or (str(local_model) if local_model.exists() else "m-a-p/YuE2-3B")
-    vae = args.vae if args.vae not in {"standard", "legacy"} else (
-        str(local_vae) if local_vae.exists() else "m-a-p/" + local_vae.name)
+    if args.vae is None and (Path(model).expanduser() / "pipeline.json").is_file():
+        vae = None
+    else:
+        vae = resolve_vae_path(args.vae)
     return model, vae
 
 
@@ -33,15 +41,19 @@ def get_pipe(args):
              vae_revision=args.vae_revision, device=args.device, memory_budget_gib=args.budget,
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar, low_vram=args.low_vram,
              local_files_only=args.offline, generation_config=config,
-             vae_core_frames=512 if args.budget <= 12 else 1024,
-             progress=not getattr(args, "quiet", False))
+             progress=not getattr(args, "quiet", False),
+             defer_vae=getattr(args, "stage", None) == "plan")
 
 
 def generation_config(args):
     if args.config:
         data = json.loads(Path(args.config).read_text(encoding="utf-8"))
-    elif getattr(args, "model", None) and (Path(args.model) / "pipeline.json").is_file():
-        data = json.loads((Path(args.model) / "pipeline.json").read_text(encoding="utf-8"))["generation_config"]
+    elif hasattr(args, "model"):
+        model, _ = model_paths(args)
+        saved = Path(model).expanduser() / "pipeline.json"
+        if not saved.is_file():
+            return GenerationConfig()
+        data = json.loads(saved.read_text(encoding="utf-8"))["generation_config"]
     else:
         return GenerationConfig()
     return GenerationConfig.from_dict(data)
@@ -82,8 +94,7 @@ def request_kwargs(data, base=None):
         raise ValueError("Request must be a JSON object")
     base = Path.cwd() if base is None else base
     allowed = {"style", "tags", "lyrics", "cot", "seed", "abc", "cfg_scale", "id", "abc_sampling", "semantic_sampling"}
-    metadata = {"lang", "eval_index", "clip_id", "prompt"}
-    unknown = set(data) - allowed - metadata - {"abc_path"}
+    unknown = set(data) - allowed - {"abc_path"}
     if unknown:
         raise ValueError(f"Unknown request fields: {sorted(unknown)}")
     result = {k: v for k, v in data.items() if k in allowed}
@@ -91,12 +102,6 @@ def request_kwargs(data, base=None):
         if data.get("abc") is not None:
             raise ValueError("Pass abc or abc_path, not both")
         result["abc"] = (base / data["abc_path"]).read_bytes().decode("utf-8")
-    if data.get("prompt") is not None:
-        from .protocol import SongRequest
-        request = SongRequest(style=result.get("style", result.get("tags")), lyrics=result["lyrics"],
-                              cot=result.get("cot", "full"))
-        if data["prompt"] != request.text():
-            raise ValueError("Historical literal prompt does not match native instruction/style/lyrics")
     return result
 
 
@@ -105,8 +110,11 @@ def export_models(args):
     directory = Path(args.output)
     if directory.exists() and any(directory.iterdir()):
         raise FileExistsError("Export needs an empty output directory")
-    with closing(get_pipe(args)) as pipe:
-        pipe.save_pretrained(directory)
+    from .pipeline import export_pipeline
+    model, vae = model_paths(args)
+    export_pipeline(directory, model, vae=vae, revision=args.revision,
+                    vae_revision=args.vae_revision, local_files_only=args.offline,
+                    generation_config=generation_config(args), progress=not args.quiet)
     print(json.dumps({"exported": True, "pipeline": str(directory / "pipeline.json")}))
     return 0
 
@@ -145,7 +153,7 @@ def decode_latents(args):
         raise ValueError("Expected nonempty [T,C] or [1,C,T] latents")
     from .modeling_vae import YuE2VAE, YuE2VAEConfig
     from .storage import resolve_model, model_identity
-    source = resolve_model(args.vae, revision=args.vae_revision, local_files_only=args.offline)
+    source = resolve_model(resolve_vae_path(args.vae), revision=args.vae_revision, local_files_only=args.offline)
     config = YuE2VAEConfig.from_pretrained(source, local_files_only=True)
     if latent.ndim == 2 and latent.shape[1] == config.latent_dim:
         latent = latent.T[None]
@@ -158,7 +166,7 @@ def decode_latents(args):
                                     device=device, local_files_only=True)
     try:
         audio = model.decode_tiled(latent, core_frames=args.vae_core_frames,
-                                   halo_frames=16, output_device="cpu")[0].transpose(0, 1).numpy()
+                                   halo_frames=None, output_device="cpu")[0].transpose(0, 1).numpy()
         if not np.isfinite(audio).all():
             raise ValueError("VAE produced non-finite audio")
         audio = audio.clip(-1, 1)
@@ -178,25 +186,48 @@ def decode_latents(args):
 
 
 def doctor(args):
-    import torch
-    from .storage import model_identity
+    from .storage import model_identity, pipeline_sources
     model, vae = model_paths(args)
-    versions = {}
-    for package in ("torch", "transformers", "huggingface-hub", "safetensors", "tiktoken", "soundfile"):
+    model, vae, _ = pipeline_sources(model, vae)
+    versions, errors, modules = {}, {}, {}
+    required = {
+        "torch": ("torch", "2.14.1" if sys.platform == "darwin" else "2.10.0"),
+        "transformers": ("transformers", "4.57.6"),
+        "huggingface-hub": ("huggingface_hub", "0.36.2"),
+        "safetensors": ("safetensors", "0.7.0"),
+        "tiktoken": ("tiktoken", "0.12.0"),
+        "numpy": ("numpy", "2.2.6"),
+        "soundfile": ("soundfile", "0.13.1"),
+    }
+    for package, (module, expected) in required.items():
         try:
-            versions[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            versions[package] = None
+            version = versions[package] = importlib.metadata.version(package)
+            if version.split("+", 1)[0] != expected:
+                errors[package] = f"Expected {expected}, found {version}"
+            modules[package] = importlib.import_module(module)
+        except Exception as exc:
+            versions.setdefault(package, None)
+            errors[package] = str(exc)
     devices = []
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        devices.append({"id": i, "name": p.name, "memory_gib": p.total_memory / 2**30,
-                        "compute_capability": [p.major, p.minor]})
-    report = {"dependencies_ready": all(versions.values()), "versions": versions,
-              "cuda": devices, "mps_available": torch.backends.mps.is_available(),
-              "xpu_available": torch.xpu.is_available(), "rocm": torch.version.hip,
-              "model": model, "vae": vae, "default_cot": "full", "default_cfg": {"full": 1., "melody": 1., "off": 1.01},
-              "validated": False, "note": "Environment readiness is not quality or real-24GB acceptance."}
+    mps_available = xpu_available = False
+    rocm = None
+    torch = modules.get("torch")
+    if torch is not None:
+        try:
+            for i in range(torch.cuda.device_count()):
+                p = torch.cuda.get_device_properties(i)
+                devices.append({"id": i, "name": p.name, "memory_gib": p.total_memory / 2**30,
+                                "compute_capability": [p.major, p.minor]})
+            mps_available = torch.backends.mps.is_available()
+            xpu_available = torch.xpu.is_available()
+            rocm = torch.version.hip
+        except Exception as exc:
+            errors["devices"] = str(exc)
+    report = {"dependencies_ready": not errors, "versions": versions, "errors": errors,
+              "cuda": devices, "mps_available": mps_available, "xpu_available": xpu_available,
+              "rocm": rocm, "model": str(model), "vae": str(vae),
+              "default_cot": "full", "default_cfg": {"full": 1., "melody": 1., "off": 1.01},
+              "validated": False}
     if args.verify_hashes:
         from .storage import resolve_model
         report["weights"] = {"model": model_identity(resolve_model(model, revision=args.revision, local_files_only=args.offline)),
@@ -211,6 +242,8 @@ def generate(args):
     if args.request:
         path = Path(args.request)
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Request must be a JSON object")
         base = path.parent
     else:
         data, base = {}, Path.cwd()
@@ -230,9 +263,14 @@ def generate(args):
                 "lyrics": "[Verse]\n晚风轻轻吹过窗前\n你留下的笑还在昨天\n[Chorus]\n让这首歌陪你走远\n把所有想念唱成明天"}
     kwargs = request_kwargs(data, base)
     request = preflight(kwargs, generation_config(args))
+    directory = Path(args.output or "runs/default") / request.id
+    resuming = args.stage != "plan" and args.resume and (directory / "result.json").is_file()
+    if directory.exists() and not directory.is_dir():
+        raise FileExistsError(f"Output is not a directory: {directory}")
+    if not resuming and directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(f"Nonempty output {directory}; use --resume or a new output directory")
     with closing(get_pipe(args)) as pipe:
-        directory = Path(args.output or "runs/default") / kwargs.get("id", "song")
-        if args.resume and (directory / "result.json").exists():
+        if resuming:
             config = pipe.effective_config(request, kwargs.get("abc_sampling"), kwargs.get("semantic_sampling"))
             expected = identity({"request": request.to_dict(), "config": config, "weights": pipe.weights})
             result = verify_result(directory, expected)
@@ -313,17 +351,19 @@ def parser():
     for name in ("doctor", "generate", "batch", "export"):
         q = sub.add_parser(name)
         q.add_argument("--model")
-        q.add_argument("--vae", default="standard", help="standard (listening), legacy (paper evaluation), local path or HF repo")
+        q.add_argument("--vae", default=None, help="standard, legacy, local path or HF repo; defaults to the exported pipeline decoder when present")
         q.add_argument("--revision")
         q.add_argument("--vae-revision")
-        q.add_argument("--device", default="auto")
-        q.add_argument("--budget", type=float, default=24)
-        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
-        q.add_argument("--quantization", choices=("none", "fp8"), default="none")
-        q.add_argument("--offload-ar", action="store_true")
-        q.add_argument("--low-vram", action="store_true", help="Keep only the active AR or NAR modules on the accelerator")
+        if name in ("generate", "batch"):
+            q.add_argument("--device", default="auto")
+            q.add_argument("--budget", type=float, default=24)
+            q.add_argument("--backend", choices=("torch", "torch-eager"), default="torch")
+            q.add_argument("--quantization", choices=("none", "fp8"), default="none")
+            q.add_argument("--offload-ar", action="store_true")
+            q.add_argument("--low-vram", action="store_true", help="Keep only the active AR or NAR modules on the accelerator")
         q.add_argument("--offline", action="store_true")
-        q.add_argument("--config")
+        if name != "doctor":
+            q.add_argument("--config")
         q.add_argument("--output", required=name == "export")
         if name == "export":
             q.add_argument("--quiet", "--no-progress", action="store_true")
@@ -351,7 +391,7 @@ def parser():
     q.add_argument("directory")
     q = sub.add_parser("decode", help="Decode standalone latents with only the VAE")
     q.add_argument("latent")
-    q.add_argument("--vae", required=True, help="Local VAE directory or Hugging Face repository")
+    q.add_argument("--vae", required=True, help="standard, legacy, local VAE directory or Hugging Face repository")
     q.add_argument("--vae-revision")
     q.add_argument("--offline", action="store_true")
     q.add_argument("--device", default="cpu")

@@ -73,7 +73,12 @@ def test_saved_pipeline_uses_its_own_decoder(monkeypatch, tmp_path):
             self.load_timing = {}
 
     monkeypatch.setattr(pipeline, "resolve_model", resolve)
-    Pipeline.from_pretrained(tmp_path, progress=False, local_files_only=True)
+    kit = tmp_path / "kit"
+    (kit / "models/YuE2-Vae").mkdir(parents=True)
+    monkeypatch.setenv("YUE2_KIT", str(kit))
+    args = cli.parser().parse_args(["generate", "--model", str(tmp_path), "--offline"])
+    model, vae = cli.model_paths(args)
+    Pipeline.from_pretrained(model, vae=vae, progress=False, local_files_only=True)
     assert resolved == [tmp_path / "model", tmp_path / "decoder"]
 
 
@@ -108,7 +113,10 @@ class LoadedPipeline:
 @pytest.mark.parametrize('mode', ['resume-corrupt','resume-complete','nonempty'])
 def test_loaded_pipeline_is_closed_on_all_early_paths(tmp_path, monkeypatch, mode):
     pipe = LoadedPipeline()
-    monkeypatch.setattr(cli,'get_pipe',lambda args: pipe)
+    def load(args):
+        assert mode != 'nonempty', 'occupied output must be rejected before loading'
+        return pipe
+    monkeypatch.setattr(cli,'get_pipe',load)
     output = tmp_path/'output'; directory = output/'song'; directory.mkdir(parents=True)
     request = SongRequest('piano','words')
     if mode == 'nonempty':
@@ -124,13 +132,17 @@ def test_loaded_pipeline_is_closed_on_all_early_paths(tmp_path, monkeypatch, mod
     if mode == 'resume-complete': assert cli.main(args) == 0
     else:
         with pytest.raises((ValueError,FileExistsError)): cli.main(args)
-    assert pipe.closed == 1
+    assert pipe.closed == (0 if mode == "nonempty" else 1)
 
 
 def test_doctor_resolves_each_requested_revision_without_network(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv('YUE2_KIT',str(tmp_path))
     monkeypatch.setitem(sys.modules,'torch',SimpleNamespace(xpu=SimpleNamespace(is_available=lambda:False),version=SimpleNamespace(hip=None),cuda=SimpleNamespace(device_count=lambda:0),backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda:False))))
-    monkeypatch.setattr(cli.importlib.metadata,'version',lambda package:'synthetic-fixture-version')
+    versions = {'torch': '2.14.1' if sys.platform == 'darwin' else '2.10.0+cpu',
+                'transformers': '4.57.6', 'huggingface-hub': '0.36.2',
+                'safetensors': '0.7.0', 'tiktoken': '0.12.0', 'numpy': '2.2.6', 'soundfile': '0.13.1'}
+    monkeypatch.setattr(cli.importlib.metadata, 'version', versions.__getitem__)
+    monkeypatch.setattr(cli.importlib, 'import_module', lambda name: sys.modules['torch'] if name == 'torch' else object())
     resolved = []
     def resolve(model, **kwargs):
         resolved.append((model, kwargs))

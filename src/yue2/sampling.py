@@ -1,4 +1,4 @@
-"""Request-local sampling, preserving mode-specific historical arithmetic."""
+"""Request-local token sampling."""
 from __future__ import annotations
 import os
 import time
@@ -21,7 +21,7 @@ def window_penalty(logits, recent_ids, penalty):
 
 
 def distribution(logits, sampling, history, step, phase, legacy_off=False):
-    # vLLM's symbolic processor receives FP32 logits; historical off uses BF16.
+    # Symbolic sampling uses FP32 logits; CoT off uses the input dtype.
     scores = logits.clone() if legacy_off else logits.float().clone()
     end = ABC_END if phase == "abc" else MUSIC_END
     allowed = torch.full_like(scores, float("-inf"))
@@ -87,7 +87,7 @@ def _graph_enabled(model, device, requested):
 
 @torch.inference_mode()
 def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_scale=1.0,
-                    legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True):
+                    legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True, use_compile=True):
     from .modeling_yue2 import StaticKVCache
     device = model.model.embed_tokens.weight.device
     dtype = model.model.embed_tokens.weight.dtype
@@ -116,7 +116,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
     graph = None
     positive_cache = negative_cache = None
     graph_enabled = _graph_enabled(model, device, use_cuda_graph)
-    decode_step = _ensure_decode_step(model) if _compile_enabled() and not graph_enabled else None
+    decode_step = _ensure_decode_step(model) if use_compile and _compile_enabled() and not graph_enabled else None
     synchronize(device)
     start = time.perf_counter()
     try:
@@ -138,7 +138,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
         for step in range(sampling.max_tokens):
             if cancelled is not None and cancelled():
                 raise InterruptedError(f"Cancelled during {phase}")
-            # Preserve historical BF16 CFG subtraction/multiply/add before upcast.
+            # Combine CFG logits in BF16 before upcasting.
             logits = conditional if cfg_scale == 1.0 else unconditional + cfg_scale * (conditional - unconditional)
             scores = distribution(logits, sampling, history, step, phase, legacy_off)
             if sampling.temperature == 0:
