@@ -14,7 +14,7 @@ def decoder_fixture(tmp_path):
         decoder_config=dict(
             common, out_channels=2, latent_dim=64, snake_type="vanilla", final_tanh=False
         ),
-        latent_dim=64,
+        latent_dim=64, decode_halo_frames=24,
     )
     model = YuE2VAE(config).eval()
     model.save_pretrained(tmp_path / "vae")
@@ -59,7 +59,8 @@ def test_valid_decode_layouts_keep_exact_native_audio(tmp_path, layout):
     z = torch.randn(1, 64, 3) * 0.1
     expected = model.decode(z)[0].float().clamp(-1, 1).T.contiguous().numpy()
     value = z[0].T.numpy() if layout == "frames" else z
-    actual = pipe.decode(value, full=True)
+    actual = pipe.decode(value)
+    np.testing.assert_array_equal(pipe.decode(value, full=True), expected)
     np.testing.assert_array_equal(actual, expected)
     assert pipe._vae is not None
     assert all(p.device.type == "cpu" for p in pipe._vae.parameters())

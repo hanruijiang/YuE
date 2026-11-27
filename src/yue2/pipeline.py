@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from .protocol import SongRequest, GenerationConfig, make_request, token_prefixes, negative_prefix, CODEC_OFFSET, resolve_sampling
-from .storage import resolve_model, model_identity, identity, write_json, collect_hashes, sha256_file, copy_model_files
+from .storage import resolve_model, model_identity, identity, write_json, collect_hashes, sha256_file, copy_model_files, pipeline_sources
 from .tokenization_yue2 import YuE2TextTokenizer
 from .sampling import generate_tokens
 from .progress import Progress
@@ -142,19 +142,6 @@ class SongResult:
         return result
 
 
-def _pipeline_sources(model, vae):
-    """Resolve the references in a relocated pipeline without initializing a device."""
-    saved = Path(model) / "pipeline.json"
-    if saved.is_file():
-        metadata = json.loads(saved.read_text(encoding="utf-8"))
-        parent = Path(model)
-        model = parent / metadata["model"]
-        if vae == "m-a-p/YuE2-Vae":
-            vae = parent / metadata["vae"]
-        return model, vae, GenerationConfig.from_dict(metadata["generation_config"])
-    return model, vae, None
-
-
 def _write_pipeline(directory, model_dir, vae_dir, generation_config, weights):
     for name, source in (("YuE2-3B", model_dir), ("YuE2-Vae", vae_dir)):
         destination = directory / name
@@ -171,7 +158,7 @@ def export_pipeline(directory, model, *, vae, revision=None, vae_revision=None,
     directory = Path(directory)
     if directory.exists() and any(directory.iterdir()):
         raise FileExistsError("save_pretrained needs an empty pipeline destination")
-    model, vae, saved_config = _pipeline_sources(model, vae)
+    model, vae, saved_config = pipeline_sources(model, vae)
     config = generation_config or saved_config or GenerationConfig()
     with Progress(enabled=progress).stage("Resolving model files"):
         model_dir = resolve_model(model, revision=revision, local_files_only=local_files_only)
@@ -231,14 +218,14 @@ class YuE2Pipeline:
             torch.cuda.set_per_process_memory_fraction(min(budget / total, 1), self.device)
 
     @classmethod
-    def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae="m-a-p/YuE2-Vae",
+    def from_pretrained(cls, model="m-a-p/YuE2-3B", *, vae=None,
                         revision=None, vae_revision=None, local_files_only=False,
                         token=None, cache_dir=None, progress=True, defer_vae=False, **kwargs):
         """Load a song pipeline with English progress on stderr; set progress=False to hide it."""
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         start = time.perf_counter()
-        model, vae, saved_config = _pipeline_sources(model, vae)
+        model, vae, saved_config = pipeline_sources(model, vae)
         if saved_config is not None:
             kwargs.setdefault("generation_config", saved_config)
         hub = dict(local_files_only=local_files_only, token=token, cache_dir=cache_dir)
@@ -443,7 +430,7 @@ class YuE2Pipeline:
                         if on_progress is not None:
                             on_progress(1, 1)
                     else:
-                        audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=16,
+                        audio = model.decode_tiled(z, core_frames=self.vae_core_frames, halo_frames=None,
                                                    output_device="cpu",
                                                    on_progress=report if (self.progress or on_progress is not None) else None)
                 if not torch.isfinite(audio).all():
@@ -456,6 +443,8 @@ class YuE2Pipeline:
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
         self._ensure_vae()
+        from .modeling_vae import YuE2VAEConfig
+        vae_config = YuE2VAEConfig.from_pretrained(self.vae_dir, local_files_only=True)
         config = self.generation_config.to_dict()
         for key, sampling in (("abc", abc_sampling), ("semantic", semantic_sampling)):
             if sampling is not None:
@@ -469,7 +458,7 @@ class YuE2Pipeline:
                 "cfg_negative": "instruction_only" if request.cot == "off" else "same_instruction_and_exact_abc",
                 "backend": self.backend, "quantization": self.quantization,
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
-                "vae_core_frames": self.vae_core_frames, "vae_halo_frames": 16,
+                "vae_core_frames": self.vae_core_frames, "vae_halo_frames": vae_config.decode_halo_frames,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
                 "offload_ar": self.offload_ar, "low_vram": self.low_vram, "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),

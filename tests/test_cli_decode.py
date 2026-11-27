@@ -15,7 +15,9 @@ from test_vae import tiny_config
 def native(tmp_path):
     torch.set_num_threads(1)
     torch.manual_seed(829)
-    model = YuE2VAE(tiny_config()).eval()
+    config = tiny_config()
+    config.decode_halo_frames = 24
+    model = YuE2VAE(config).eval()
     vae = tmp_path / "vae"
     model.save_pretrained(vae)
     latent = torch.randn(1, 2, 3)
@@ -141,6 +143,7 @@ def test_decoder_refuses_nonfinite_output_and_releases_model(tmp_path, native, m
 
     class Decoder:
         def decode_tiled(self, *args, **kwargs):
+            assert kwargs["halo_frames"] is None
             return torch.full((1, 2, 8), float("nan"))
 
         def to(self, device):

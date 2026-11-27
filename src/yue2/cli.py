@@ -20,8 +20,12 @@ def model_paths(args):
     local_model = root / "models/YuE2-3B"
     local_vae = root / "models" / ("YuE2-Vae-legacy" if args.vae == "legacy" else "YuE2-Vae")
     model = args.model or (str(local_model) if local_model.exists() else "m-a-p/YuE2-3B")
-    vae = args.vae if args.vae not in {"standard", "legacy"} else (
-        str(local_vae) if local_vae.exists() else "m-a-p/" + local_vae.name)
+    if args.vae is None and (Path(model).expanduser() / "pipeline.json").is_file():
+        vae = None
+    elif args.vae is None or args.vae in {"standard", "legacy"}:
+        vae = str(local_vae) if local_vae.exists() else "m-a-p/" + local_vae.name
+    else:
+        vae = args.vae
     return model, vae
 
 
@@ -41,8 +45,12 @@ def get_pipe(args):
 def generation_config(args):
     if args.config:
         data = json.loads(Path(args.config).read_text(encoding="utf-8"))
-    elif getattr(args, "model", None) and (Path(args.model) / "pipeline.json").is_file():
-        data = json.loads((Path(args.model) / "pipeline.json").read_text(encoding="utf-8"))["generation_config"]
+    elif hasattr(args, "model"):
+        model, _ = model_paths(args)
+        saved = Path(model).expanduser() / "pipeline.json"
+        if not saved.is_file():
+            return GenerationConfig()
+        data = json.loads(saved.read_text(encoding="utf-8"))["generation_config"]
     else:
         return GenerationConfig()
     return GenerationConfig.from_dict(data)
@@ -161,7 +169,7 @@ def decode_latents(args):
                                     device=device, local_files_only=True)
     try:
         audio = model.decode_tiled(latent, core_frames=args.vae_core_frames,
-                                   halo_frames=16, output_device="cpu")[0].transpose(0, 1).numpy()
+                                   halo_frames=None, output_device="cpu")[0].transpose(0, 1).numpy()
         if not np.isfinite(audio).all():
             raise ValueError("VAE produced non-finite audio")
         audio = audio.clip(-1, 1)
@@ -182,8 +190,10 @@ def decode_latents(args):
 
 def doctor(args):
     import torch
-    from .storage import model_identity
+    from .storage import model_identity, pipeline_sources
     model, vae = model_paths(args)
+    model, vae, _ = pipeline_sources(model, vae)
+    model, vae = str(model), str(vae)
     versions = {}
     for package in ("torch", "transformers", "huggingface-hub", "safetensors", "tiktoken",
                     "numpy", "soundfile", "accelerate"):
@@ -317,7 +327,7 @@ def parser():
     for name in ("doctor", "generate", "batch", "export"):
         q = sub.add_parser(name)
         q.add_argument("--model")
-        q.add_argument("--vae", default="standard", help="standard (listening), legacy (paper evaluation), local path or HF repo")
+        q.add_argument("--vae", default=None, help="standard (listening), legacy (paper evaluation), local path or HF repo; defaults to the exported pipeline decoder when present")
         q.add_argument("--revision")
         q.add_argument("--vae-revision")
         if name in ("generate", "batch"):

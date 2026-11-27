@@ -47,6 +47,20 @@ MODEL_LICENSES = frozenset({"stable-audio-tools-MIT.txt", "SnakeBeta-NVIDIA-MIT.
 SHARD_NAME = re.compile(r"model-[0-9]{5}-of-[0-9]{5}\.safetensors")
 
 
+def pipeline_sources(model, vae):
+    """Resolve the references in a relocated pipeline without initializing a device."""
+    from .protocol import GenerationConfig
+    parent = Path(model).expanduser()
+    saved = parent / "pipeline.json"
+    if saved.is_file():
+        metadata = json.loads(saved.read_text(encoding="utf-8"))
+        model = parent / metadata["model"]
+        if vae is None:
+            vae = parent / metadata["vae"]
+        return model, vae, GenerationConfig.from_dict(metadata["generation_config"])
+    return model, "m-a-p/YuE2-Vae" if vae is None else vae, None
+
+
 def resolve_model(model, revision=None, local_files_only=False, token=None, cache_dir=None, **kwargs):
     path = Path(model).expanduser()
     if path.is_dir():

@@ -73,7 +73,12 @@ def test_saved_pipeline_uses_its_own_decoder(monkeypatch, tmp_path):
             self.load_timing = {}
 
     monkeypatch.setattr(pipeline, "resolve_model", resolve)
-    Pipeline.from_pretrained(tmp_path, progress=False, local_files_only=True)
+    kit = tmp_path / "kit"
+    (kit / "models/YuE2-Vae").mkdir(parents=True)
+    monkeypatch.setenv("YUE2_KIT", str(kit))
+    args = cli.parser().parse_args(["generate", "--model", str(tmp_path), "--offline"])
+    model, vae = cli.model_paths(args)
+    Pipeline.from_pretrained(model, vae=vae, progress=False, local_files_only=True)
     assert resolved == [tmp_path / "model", tmp_path / "decoder"]
 
 

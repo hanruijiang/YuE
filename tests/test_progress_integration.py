@@ -145,7 +145,7 @@ def test_pipeline_passes_acoustic_callbacks_only_when_enabled(enabled, monkeypat
         def decode_tiled(self, latent, *, core_frames, halo_frames, output_device, on_progress):
             seen.append(on_progress is not None)
             assert torch.equal(latent, expected.T.unsqueeze(0))
-            assert (core_frames, halo_frames, output_device) == (1, 16, 'cpu')
+            assert (core_frames, halo_frames, output_device) == (1, None, 'cpu')
             if on_progress is not None:
                 on_progress(1, 2)
                 on_progress(2, 2)
