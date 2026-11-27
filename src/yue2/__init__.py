@@ -1,4 +1,4 @@
-"""YuE2 song generation. Optional backends are imported only when requested."""
+"""YuE2 song generation with PyTorch."""
 __version__ = "0.1.6"
 
 

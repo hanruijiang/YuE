@@ -21,7 +21,7 @@ def window_penalty(logits, recent_ids, penalty):
 
 
 def distribution(logits, sampling, history, step, phase, legacy_off=False):
-    # vLLM's symbolic processor receives FP32 logits; historical off uses BF16.
+    # Symbolic sampling uses FP32 logits; historical off preserves the input dtype.
     scores = logits.clone() if legacy_off else logits.float().clone()
     end = ABC_END if phase == "abc" else MUSIC_END
     allowed = torch.full_like(scores, float("-inf"))

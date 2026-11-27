@@ -18,7 +18,7 @@ python -m pip install .
 yue2 doctor
 ```
 
-On Windows, activate with `.venv\Scripts\activate`. Install the appropriate PyTorch build before installing the package. The runtime pins PyTorch 2.10.0 on non-macOS and 2.14.1 on macOS. For Intel XPU on Linux, use `uv sync --extra xpu` (mutually exclusive with `fast`). For NVIDIA vLLM acceleration on Linux, install `.[fast]` in a compatible environment and pass `--backend vllm`.
+On Windows, activate with `.venv\Scripts\activate`. Install the appropriate PyTorch build before installing the package. The runtime pins PyTorch 2.10.0 on non-macOS and 2.14.1 on macOS. For Intel XPU on Linux, use `uv sync --extra xpu`.
 
 ## Generate
 
@@ -67,7 +67,7 @@ yue2 export --output offline-pipeline
 yue2 generate --request examples/song.json --model offline-pipeline --offline --device cuda --output runs/offline
 ```
 
-`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes, not audio quality. `decode` loads only the VAE and accepts finite floating-point latent arrays in [T,C] or [1,C,T] layout. `export` prepares a portable local pipeline for offline inference without selecting a device or loading model tensors. `doctor` checks the eight required package metadata entries and reports available devices; it does not accept generation-specific options or validate optional backends. Existing nonempty output directories are refused unless the command supports verified resume.
+`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes, not audio quality. `decode` loads only the VAE and accepts finite floating-point latent arrays in [T,C] or [1,C,T] layout. `export` prepares a portable local pipeline for offline inference without selecting a device or loading model tensors. `doctor` checks the eight required package metadata entries and reports available devices; it does not accept generation-specific options. Existing nonempty output directories are refused unless the command supports verified resume.
 
 ## Devices and memory
 

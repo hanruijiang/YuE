@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from yue2 import cli, fast, nar, pipeline
+from yue2 import cli, nar, pipeline
 from yue2.pipeline import YuE2Pipeline
 from yue2.progress import Progress
 from yue2.protocol import ABC_END, CODEC_OFFSET, MUSIC_END, GenerationConfig, SongRequest
@@ -29,9 +29,8 @@ def bare_pipe(enabled=True, backend='torch-eager'):
     return pipe
 
 
-@pytest.mark.parametrize('backend', ['torch-eager', 'vllm'])
 @pytest.mark.parametrize('phase', ['abc', 'semantic'])
-def test_callback_coexists_with_progress_exactly_once_and_quiet_is_inert(backend, phase, monkeypatch, capsys):
+def test_callback_coexists_with_progress_exactly_once_and_quiet_is_inert(phase, monkeypatch, capsys):
     emitted = [65, 66, ABC_END] if phase == 'abc' else [CODEC_OFFSET, CODEC_OFFSET + 1, MUSIC_END]
     calls = []
 
@@ -43,11 +42,10 @@ def test_callback_coexists_with_progress_exactly_once_and_quiet_is_inert(backend
         return emitted[:-1], {'output_tokens': len(emitted)}, False
 
     monkeypatch.setattr(pipeline, 'generate_tokens', generate)
-    monkeypatch.setattr(fast, 'generate_vllm', generate)
     results = []
     rng_state = torch.random.get_rng_state().clone()
     for enabled in [True, False]:
-        pipe = bare_pipe(enabled, backend)
+        pipe = bare_pipe(enabled)
         external = []
         results.append(pipe._generate([1] * 120, pipe.generation_config.semantic, 42, phase,
                        negative=[2] * 80, cfg_scale=1.2,

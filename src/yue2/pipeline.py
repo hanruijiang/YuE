@@ -176,14 +176,12 @@ class YuE2Pipeline:
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
-        if backend not in {"torch", "torch-eager", "vllm"}:
-            raise ValueError("backend must be torch, torch-eager, or vllm")
+        if backend not in {"torch", "torch-eager"}:
+            raise ValueError("backend must be torch or torch-eager")
         if quantization not in {"none", "fp8"}:
             raise ValueError("quantization must be none or fp8")
         if not math.isfinite(memory_budget_gib) or not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be finite and positive")
-        if low_vram and backend == "vllm":
-            raise ValueError("low_vram requires backend='torch' or 'torch-eager'")
         self.low_vram = low_vram
         self.device = resolve_device(device)
         torch.backends.cudnn.benchmark = False
@@ -302,7 +300,7 @@ class YuE2Pipeline:
         return self._model
 
     def _generate(self, prefix, sampling, seed, phase, **kwargs):
-        model = self._load_model() if self.backend != "vllm" else None
+        model = self._load_model()
         callback = kwargs.pop("on_token", None)
         label = "Planning score" if phase == "abc" else "Generating song"
         with self._status(label, unit="tokens") as status:
@@ -313,13 +311,9 @@ class YuE2Pipeline:
                 if callback is not None:
                     callback(token_phase, token)
             observed = on_output if self.progress else callback
-            if self.backend == "vllm":
-                from .fast import generate_vllm
-                result = generate_vllm(self, prefix, sampling, seed, phase, on_token=observed, **kwargs)
-            else:
-                result = generate_tokens(model, prefix, sampling, seed, phase,
-                                         use_cuda_graph=self.backend != "torch-eager",
-                                         use_compile=self.backend != "torch-eager", on_token=observed, **kwargs)
+            result = generate_tokens(model, prefix, sampling, seed, phase,
+                                     use_cuda_graph=self.backend != "torch-eager",
+                                     use_compile=self.backend != "torch-eager", on_token=observed, **kwargs)
             if result[2]:
                 status.finish(status="truncated")
             return result
@@ -357,9 +351,6 @@ class YuE2Pipeline:
     def synthesize(self, semantic, *, cancelled=None, on_progress=None):
         """Synthesize latents; ``on_progress(completed, total)`` reports ODE steps."""
         from .nar import synthesize
-        if self.backend == "vllm":
-            from .fast import close_vllm
-            close_vllm(self)
         if not isinstance(semantic, SemanticResult):
             raise TypeError("Pass the SemanticResult returned by generate_semantic()")
         if token_prefixes(semantic.plan.request, self.tokenizer, semantic.plan.abc_ids) != semantic.plan.prefix:
@@ -380,9 +371,6 @@ class YuE2Pipeline:
             return result.detach().float().cpu().numpy()
 
     def close(self):
-        if self.backend == "vllm":
-            from .fast import close_vllm
-            close_vllm(self)
         self._model, self._vae = None, None
         empty_cache(self.device)
 

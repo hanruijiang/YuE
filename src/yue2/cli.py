@@ -333,7 +333,7 @@ def parser():
         if name in ("generate", "batch"):
             q.add_argument("--device", default="auto")
             q.add_argument("--budget", type=float, default=24)
-            q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
+            q.add_argument("--backend", choices=("torch", "torch-eager"), default="torch")
             q.add_argument("--quantization", choices=("none", "fp8"), default="none")
             q.add_argument("--offload-ar", action="store_true")
             q.add_argument("--low-vram", action="store_true", help="Keep only the active AR or NAR modules on the accelerator")

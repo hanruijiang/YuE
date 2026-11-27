@@ -2,7 +2,7 @@
 
 The graph predicts branch logits only. The caller combines logits and samples
 once, then passes that same token to ``step``. Prefixes retain independent RoPE
-positions and cache slots. No vLLM, Triton, or custom extension is imported.
+positions and cache slots. Uses PyTorch operations only.
 """
 from __future__ import annotations
 from numbers import Integral
