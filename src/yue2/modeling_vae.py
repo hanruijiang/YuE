@@ -255,10 +255,7 @@ class OobleckDecoder(nn.Module):
 
 
 class YuE2VAEConfig(PretrainedConfig):
-    """Configuration shared by YuE2-Vae and YuE2-Vae-legacy.
-
-    Use ``standard`` for listening and ``legacy`` for the paper metric baseline.
-    """
+    """Configuration for YuE2 VAE checkpoints."""
 
     model_type = "yue2_vae"
 
@@ -400,7 +397,7 @@ class YuE2VAE(PreTrainedModel):
         from safetensors import safe_open
         requested_dtype = dtype if dtype is not None else torch_dtype
         if requested_dtype not in (None, "auto", "float32", torch.float32):
-            raise ValueError("The validated VAE requires FP32; quantize the LM separately")
+            raise ValueError("The VAE requires FP32")
         device_map = kwargs.pop("device_map", None)
         if device_map is not None:
             if device_map == "auto":
@@ -493,8 +490,7 @@ class YuE2VAE(PreTrainedModel):
         """Encode FP32 stereo audio; posterior mean by default.
 
         Set ``sample=True`` with a per-request ``torch.Generator`` to reproduce
-        stochastic posterior sampling. This audio VAE is not the unreleased
-        semantic audio tokenizer semantic tokenizer.
+        stochastic posterior sampling. 
         """
         if self.decoder_only:
             raise RuntimeError("Encoder not loaded; reload with decoder_only=False")

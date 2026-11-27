@@ -74,6 +74,7 @@ def test_hf_download_is_restricted_to_inference_files(monkeypatch, tmp_path):
     resolve_model('example/YuE2', revision='a' * 40, local_files_only=True)
     assert '*.json' not in captured['allow_patterns'] and '*.py' not in captured['allow_patterns']
     assert 'config.json' in captured['allow_patterns']
+    assert 'modeling_yue2.py' not in captured['allow_patterns'] and 'modeling_vae.py' not in captured['allow_patterns']
     assert captured['revision'] == 'a' * 40 and captured['local_files_only']
 
 

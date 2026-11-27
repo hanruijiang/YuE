@@ -36,13 +36,12 @@ def reference_prefill(model, prefixes, budget):
 
 
 @pytest.mark.parametrize("prefixes", [[[2, 3, 4]], [[2, 3, 4, 5], [6]]])
-@pytest.mark.parametrize("fused", [False, True])
-def test_graph_equations_match_original_static_cache_and_only_use_ar_experts(model, prefixes, fused):
+def test_graph_equations_match_original_static_cache_and_only_use_ar_experts(model, prefixes):
     with torch.inference_mode(), ExitStack() as stack:
         forbidden = [stack.enter_context(patch.object(layer.nar_self_attn, "project_qkv", side_effect=AssertionError("NAR used")))
                      for layer in model.model.layers]
         original, expected = reference_prefill(model, prefixes, 5)
-        graph = GraphAR(model, prefixes, 5, capture=False, fuse_projections=fused)
+        graph = GraphAR(model, prefixes, 5, capture=False)
         torch.testing.assert_close(graph.prefill(), expected, atol=1e-7, rtol=1e-5)
         pointers = [value.data_ptr() for value in graph.keys + graph.values]
         for index, token in enumerate([7, 8, 9, 10]):
@@ -118,8 +117,7 @@ def test_quantized_model_requires_explicit_eager_path(model):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA capture requires an actual allocated GPU")
 @pytest.mark.parametrize("prefixes", [[[2, 3, 4]], [[2, 3, 4, 5], [6]]])
 @pytest.mark.parametrize("backend", ["auto", "cudnn", "auto-without-flash"])
-@pytest.mark.parametrize("fused", [False, True])
-def test_real_cuda_graph_bfloat16_parity(model, prefixes, backend, fused, monkeypatch):
+def test_real_cuda_graph_bfloat16_parity(model, prefixes, backend, monkeypatch):
     # Head size 8 exercises fused CUDA paths, as does the real head size 128.
     expected_backend = "flash" if backend == "auto" else "cudnn"
     if backend == "auto-without-flash":
@@ -132,7 +130,7 @@ def test_real_cuda_graph_bfloat16_parity(model, prefixes, backend, fused, monkey
             max_position_embeddings=64, max_latent_frames=64)).eval().to(device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
         original, expected = reference_prefill(model, prefixes, 5)
-        graph = GraphAR(model, prefixes, 5, attention_backend=backend, fuse_projections=fused)
+        graph = GraphAR(model, prefixes, 5, attention_backend=backend)
         torch.testing.assert_close(graph.prefill(), expected, atol=0, rtol=0)
         assert graph.graph is not None
         assert graph.attention_backend == expected_backend

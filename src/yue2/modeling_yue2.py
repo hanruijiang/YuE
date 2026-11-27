@@ -548,15 +548,12 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        if labels is not None and (not isinstance(logits_to_keep, int) or logits_to_keep != 0):
-            raise ValueError("Loss computation requires logits_to_keep=0")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Supply exactly one of input_ids or inputs_embeds")
         use_cache = use_cache if use_cache is not None else getattr(self.config, "use_cache", True)
@@ -612,20 +609,12 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
             selected = hidden_states[:, -logits_to_keep:, :] if logits_to_keep else hidden_states
         else:
             selected = hidden_states[:, logits_to_keep.to(device), :]
-        if labels is not None and selected.shape[1] != hidden_states.shape[1]:
-            raise ValueError("Loss computation requires logits_to_keep=0")
         logits = self.lm_head(selected)
-
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
             output = (logits, past_key_values) if use_cache else (logits,)
-            return ((loss,) + output) if loss is not None else output
-        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values if use_cache else None)
+            return output
+        return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values if use_cache else None)
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None,
@@ -657,7 +646,6 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
         }
 
 
-# Keep custom code + auto_map when a local user calls save_pretrained as well
-# as when the release builder creates a Hub repository.
+# Include the model implementation in Hugging Face exports.
 YuE2Config.register_for_auto_class()
 YuE2ForCausalLM.register_for_auto_class("AutoModelForCausalLM")

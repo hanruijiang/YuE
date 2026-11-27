@@ -1,13 +1,13 @@
 # YuE2 CLI inference
 
-A command-line-only distribution of the [YuE2](https://github.com/multimodal-art-projection/YuE) inference runtime. Generate songs from style and lyrics, optionally conditioned on a native ABC score. No agent skill, transcription service, UI, or benchmark toolkit is included.
+A command-line-only distribution of the [YuE2](https://github.com/multimodal-art-projection/YuE) inference runtime. Generate songs from style and lyrics, optionally conditioned on a native ABC score.
 
 ## Installation
 
 Use Python 3.12 and a fresh virtual environment. The recommended starting point is a BF16-capable NVIDIA GPU with 24 GB VRAM.
 
 ```bash
-git clone https://github.com/hanruijiang/YuE.git
+git clone -b cleanup/cli-inference-only https://github.com/hanruijiang/YuE.git
 cd YuE
 python -m venv .venv
 source .venv/bin/activate
@@ -29,7 +29,7 @@ yue2 generate --style "English, acoustic pop, piano" --lyrics "[Verse] A new day
 
 The default model and decoder are [YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B) and [YuE2-Vae](https://huggingface.co/m-a-p/YuE2-Vae). They are downloaded from Hugging Face when needed. You can instead specify local checkpoint directories with `--model` and `--vae`, pin revisions with `--revision` and `--vae-revision`, or use `--offline` to forbid downloads.
 
-The JSON request accepts `id`, `style` (or `tags`), `lyrics`, `cot`, `seed`, `cfg_scale`, optional `abc` or `abc_path`, and sampling overrides. IDs must be unique in a batch; paths in `abc_path` are relative to the request file.
+The JSON request accepts `id`, `style` (or `tags`), `lyrics`, `cot`, `seed`, `cfg_scale`, optional `abc` or `abc_path`, and `abc_sampling` / `semantic_sampling` overrides. IDs must be unique in a batch; paths in `abc_path` are relative to the request file.
 
 - `--cot full`: melody and chords (default).
 - `--cot melody`: melody only.
@@ -42,7 +42,9 @@ yue2 generate --request examples/song.json --abc-file examples/score.abc --cot f
 yue2 generate --request examples/song.json --stage plan --output runs/plan
 ```
 
-The native ABC score uses Vocal and Ins voices. Empty lyrics are accepted, but do not guarantee voice-free audio. The CLI does not transcribe source recordings.
+The native ABC score uses Vocal and Ins voices. Lyrics may be empty.
+
+Generation configuration comes from `--config`, an exported `pipeline.json`, or built-in defaults (in that order). A model repository’s `yue2_generation_config.json` can be selected explicitly with `--config`.
 
 ## Batch inference and saved outputs
 
@@ -55,19 +57,19 @@ yue2 batch --input requests.jsonl --device cuda --output runs/batch
 yue2 batch --input requests.jsonl --device cuda --output runs/batch --resume
 ```
 
-Batch processing is sequential (`--concurrency 1`). Generation saves artifacts under the output directory and request ID, including `audio.flac` (48 kHz stereo with the default decoder), `score.abc` when applicable, `plan.json`, semantic tokens, `latent.npy`, and `result.json`. Check truncation flags in the result; a playable file does not guarantee the generation finished without token limits. Resume verifies request, configuration, model and artifact identities. Use a fresh output directory for changed requests.
+Batch processing is sequential (`--concurrency 1`). Generation saves artifacts under the output directory and request ID, including `audio.flac` (48 kHz stereo with the default decoder), `score.abc` when applicable, `plan.json`, semantic tokens, `latent.npy`, and `result.json`. The result records whether generation reached its token limits. Resume verifies request, configuration, model and artifact identities. Use a fresh output directory for changed requests.
 
 ## Inference utilities
 
 ```bash
 yue2 validate --request examples/song.json
 yue2 inspect runs/single/city_lights
-yue2 decode runs/single/city_lights/latent.npy --vae m-a-p/YuE2-Vae --device cuda --output decoded.wav
+yue2 decode runs/single/city_lights/latent.npy --vae standard --device cuda --output decoded.wav
 yue2 export --output offline-pipeline
 yue2 generate --request examples/song.json --model offline-pipeline --offline --device cuda --output runs/offline
 ```
 
-`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes, not audio quality. `decode` loads only the VAE and accepts finite floating-point latent arrays in [T,C] or [1,C,T] layout. `export` prepares a portable local pipeline for offline inference without selecting a device or loading model tensors. `doctor` checks the eight required package metadata entries and reports available devices; it does not accept generation-specific options. Existing nonempty output directories are refused unless the command supports verified resume.
+`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes. `decode` loads only the VAE, accepts latent arrays in [T,C] or [1,C,T] layout, and supports `--vae standard`, `legacy`, a local directory or a Hub repository. `export` prepares a portable local pipeline for offline inference without selecting a device or loading model tensors. `doctor` checks required package versions and imports and reports available devices. Existing nonempty output directories are refused unless the command supports verified resume.
 
 ## Devices and memory
 
@@ -86,7 +88,7 @@ python -m pip install '.[test]'
 python -m pytest -q
 ```
 
-The CPU tests use small local models without downloading production weights. They do not establish full-model audio quality or hardware-specific performance.
+The CPU tests use small local models without downloading production weights.
 
 ## License and attribution
 

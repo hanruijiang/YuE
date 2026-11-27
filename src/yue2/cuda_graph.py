@@ -66,7 +66,7 @@ class GraphAR:
     output storage and remain valid until the next step. ``capture=False`` is
     an eager diagnostic path for CPU/tiny-model correctness checks.
     """
-    def __init__(self, model, prefixes, max_tokens, *, capture=True, attention_backend="auto", fuse_projections=False):
+    def __init__(self, model, prefixes, max_tokens, *, capture=True, attention_backend="auto"):
         if model.training:
             raise ValueError("GraphAR requires model.eval()")
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, Integral) or max_tokens < 1:
@@ -116,16 +116,6 @@ class GraphAR:
         self.cu_k = self.cu_q * self.capacity
         self.tokens = torch.tensor([[prefix[-1]] for prefix in prefixes], dtype=torch.long, device=self.device)
         self.kv_bytes = 2 * len(self.keys) * self.keys[0].numel() * self.keys[0].element_size()
-        self.fused_weights = []
-        if fuse_projections:
-            if any(module.bias is not None for module in linears):
-                raise ValueError("Fused projections require the checkpoint's bias-free AR linears")
-            with torch.no_grad():
-                for layer in model.model.layers:
-                    self.fused_weights.append((torch.cat([layer.self_attn.q_proj.weight, layer.self_attn.k_proj.weight,
-                                                         layer.self_attn.v_proj.weight], dim=0),
-                                               torch.cat([layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0)))
-        self.fused_weight_bytes = sum(value.numel() * value.element_size() for pair in self.fused_weights for value in pair)
 
     @torch.inference_mode()
     def _decode(self):
@@ -139,28 +129,15 @@ class GraphAR:
         config = self.model.config
         slots = self.positions[:, None, None, None].expand(
             self.branches, 1, config.num_key_value_heads, config.head_dim)
-        for index, (layer, keys, values) in enumerate(zip(backbone.layers, self.keys, self.values)):
+        for layer, keys, values in zip(backbone.layers, self.keys, self.values):
             normalized = layer.input_layernorm(x)
-            if self.fused_weights:
-                from .modeling_yue2 import _apply_rotary
-                sizes = (config.num_attention_heads * config.head_dim,
-                         config.num_key_value_heads * config.head_dim, config.num_key_value_heads * config.head_dim)
-                q, k, v = F.linear(normalized, self.fused_weights[index][0]).split(sizes, dim=-1)
-                q = layer.self_attn.q_norm(q.view(self.branches, 1, config.num_attention_heads, config.head_dim))
-                k = layer.self_attn.k_norm(k.view(self.branches, 1, config.num_key_value_heads, config.head_dim))
-                v = v.view(self.branches, 1, config.num_key_value_heads, config.head_dim)
-                q = _apply_rotary(q, cos.unsqueeze(2), sin.unsqueeze(2))
-                k = _apply_rotary(k, cos.unsqueeze(2), sin.unsqueeze(2))
-            else:
-                q, k, v = layer.self_attn.project_qkv(normalized, cos, sin)
+            q, k, v = layer.self_attn.project_qkv(normalized, cos, sin)
             keys.scatter_(1, slots, k)
             values.scatter_(1, slots, v)
             # All allocated slots are present, but only each branch's completed
             # prefix and the current token are visible. Future slots never leak.
             if self.attention_backend == "flash":
-                # seqused_k is respected by the 3D packed/varlen entrypoint.
-                # The 4D fixed-batch entrypoint ignores it in torch 2.10, so do
-                # not replace this call with an apparently equivalent 4D call.
+                # Packed attention uses seqused_k to exclude unused cache slots.
                 h = torch.ops.aten._flash_attention_forward(
                     q[:, 0], keys.view(-1, config.num_key_value_heads, config.head_dim),
                     values.view(-1, config.num_key_value_heads, config.head_dim),
@@ -181,11 +158,7 @@ class GraphAR:
                             enable_gqa=config.num_attention_heads != config.num_key_value_heads).transpose(1, 2)
             x = x + layer.self_attn.o_proj(h.reshape(self.branches, 1, -1))
             normalized = layer.post_attention_layernorm(x)
-            if self.fused_weights:
-                gate, up = F.linear(normalized, self.fused_weights[index][1]).chunk(2, dim=-1)
-                x = x + layer.mlp.down_proj(F.silu(gate) * up)
-            else:
-                x = x + layer.mlp(normalized)
+            x = x + layer.mlp(normalized)
         output = self.model.lm_head(backbone.norm(x))[:, 0]
         self.positions.add_(1)
         return output
@@ -257,7 +230,6 @@ class GraphAR:
         self.graph = self.output = None
         self.keys.clear()
         self.values.clear()
-        self.fused_weights.clear()
         self.tokens = self.positions = self.initial_positions = self.key_positions = None
         self.cu_q = self.cu_k = None
         self.closed = True

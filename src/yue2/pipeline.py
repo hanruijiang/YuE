@@ -275,7 +275,7 @@ class YuE2Pipeline:
                     from .modeling_yue2 import YuE2ForCausalLM
                     start = time.perf_counter()
                     self._model = YuE2ForCausalLM.from_pretrained(self.model_dir, local_files_only=True,
-                                  torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+                                  dtype=torch.bfloat16).eval()
                     self.load_timing["mot_load_seconds"] = time.perf_counter() - start
                 if for_nar and getattr(self._model, "_yue2_fp8_originals", None):
                     from .quantization import restore_ar
@@ -433,6 +433,8 @@ class YuE2Pipeline:
         self._ensure_vae()
         from .modeling_vae import YuE2VAEConfig
         vae_config = YuE2VAEConfig.from_pretrained(self.vae_dir, local_files_only=True)
+        if vae_config.latent_dim != 64:
+            raise ValueError("Song generation requires a 64-channel VAE")
         config = self.generation_config.to_dict()
         for key, sampling in (("abc", abc_sampling), ("semantic", semantic_sampling)):
             if sampling is not None:
@@ -447,6 +449,7 @@ class YuE2Pipeline:
                 "backend": self.backend, "quantization": self.quantization,
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
                 "vae_core_frames": self.vae_core_frames, "vae_halo_frames": vae_config.decode_halo_frames,
+                "sample_rate": vae_config.sample_rate,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
                 "offload_ar": self.offload_ar, "low_vram": self.low_vram, "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text(encoding="utf-8")).get("release_variant"),
@@ -474,6 +477,7 @@ class YuE2Pipeline:
         timing = {"abc": plan.timing, "semantic": semantic.timing, "nar_seconds": nar_seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
                   "e2e_seconds": time.perf_counter() - start}
-        Progress(enabled=self.progress).complete(len(audio) / 48000, timing["e2e_seconds"],
+        sample_rate = config["sample_rate"]
+        Progress(enabled=self.progress).complete(len(audio) / sample_rate, timing["e2e_seconds"],
                                                 truncated=plan.truncated or semantic.truncated)
-        return SongResult(audio, 48000, semantic, latents, config, self.weights, timing, request_id)
+        return SongResult(audio, sample_rate, semantic, latents, config, self.weights, timing, request_id)

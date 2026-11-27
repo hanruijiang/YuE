@@ -1,7 +1,7 @@
-"""Memory-bounded acoustic flow matching with one AR prefill per original chunk.
+"""Memory-bounded acoustic flow matching with one AR prefill per context chunk.
 
 Only PyTorch is required. The reference 32-step midpoint solver, full-song CPU
-FP32 noise draw, boundary positions, and original context chunks are preserved.
+Uses FP32 noise and context-aligned chunks.
 Attention query tiling changes temporary storage, never the visible key set.
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _integers(values, name):
 
 
 def song_chunks(prefix, codec, seed, context=CONTEXT):
-    """Draw the complete noise tensor once, then take views at historical cuts."""
+    """Draw the complete noise tensor once, then take views at context boundaries."""
     prefix = _integers(prefix, "prefix")
     codec = _integers(codec, "codec")
     if min(prefix) < 0 or min(codec) < 0 or max(codec) >= CODEC_SIZE:
@@ -98,7 +98,7 @@ def attention(q, k, v, *, causal=False, backend="sdpa", query_chunk_size=None):
 
 
 class CachedNAR:
-    """One original acoustic chunk; AR prefix KV is invariant during the ODE."""
+    """One acoustic chunk with fixed AR prefix KV during the ODE."""
 
     def __init__(self, model, chunk: Chunk, attention="sdpa", query_chunk_size=None):
         self.model, self.chunk = model, chunk
@@ -244,12 +244,12 @@ def synthesize(model, prefix: Sequence[int], codec: Sequence[int], seed: int,
                steps=32, context=CONTEXT, attention="sdpa", offload_ar=False,
                cancelled=None, query_chunk_size=None, low_vram=False,
                on_progress: Callable[[int, int], None] | None = None):
-    """Return CPU FP32 [frames,64] latents, solving original chunks serially.
+    """Return CPU FP32 [frames,64] latents, solving chunks serially.
 
     Defaults preserve the release protocol. Explicit steps/context overrides
     belong in the caller's effective configuration record. ``offload_ar`` is
     an optional memory tradeoff and requires exclusive access to ``model``.
-    Progress counts submitted midpoint steps across all original chunks; it
+    Progress counts submitted midpoint steps across all chunks; it
     introduces no device synchronization. Callback exceptions propagate after
     the current chunk's cache is released and any offloaded weights restored.
     """
