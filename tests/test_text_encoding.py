@@ -17,7 +17,7 @@ from yue2.protocol import SongRequest, token_prefixes
 from yue2.storage import write_json
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIPPED = (ROOT / "src" / "yue2", ROOT / "skills" / "yue2-music" / "scripts")
+SHIPPED = (ROOT / "src" / "yue2",)
 TEXT_IO = {"read_text", "write_text"}
 
 # A Mandarin request like the CLI's own default, with an ABC annotation that

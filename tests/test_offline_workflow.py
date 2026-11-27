@@ -1,7 +1,6 @@
 """Exercise the public workflow with real, small models and no downloads."""
 
 import base64
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -218,58 +217,3 @@ def test_real_batch_preflight_resume_and_relocated_export(offline_models, tmp_pa
     assert replayed.semantic.tokens == song.semantic.tokens
     np.testing.assert_array_equal(replayed.latents, song.latents)
     np.testing.assert_array_equal(replayed.audio, song.audio)
-
-
-def test_instrumental_preview_preserves_native_and_reports_short_source(
-    offline_models, tmp_path, monkeypatch, capsys
-):
-    root = Path(__file__).resolve().parents[1]
-    helper = root / "skills/yue2-music/instrumental/scripts/instrumental.py"
-    prepared = tmp_path / "prepared"
-    subprocess.run(
-        [
-            sys.executable,
-            "-B",
-            str(helper),
-            "prepare",
-            "--abc",
-            str(helper.parents[1] / "assets/example-ins.abc"),
-            "--output",
-            str(prepared),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    script = root / "examples/instrumental_clip.py"
-    spec = importlib.util.spec_from_file_location("instrumental_clip", script)
-    example = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(example)
-    # Redirect only the checkpoint location; execute the real model and file APIs.
-    pipe = open_pipeline(offline_models)
-    monkeypatch.setattr(YuE2Pipeline, "from_pretrained", lambda **kwargs: pipe)
-    for seconds, expected_code in [(0.05, 0), (1, 1)]:
-        output = tmp_path / f"preview-{seconds}"
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                str(script),
-                "--prepared",
-                str(prepared),
-                "--seconds",
-                str(seconds),
-                "--device",
-                "cpu",
-                "--output",
-                str(output),
-            ],
-        )
-        assert example.main() == expected_code
-        record = json.loads(capsys.readouterr().out)
-        native = SongResult.load(output / "native")
-        clip, rate = sf.read(output / "clip.wav", dtype="float32")
-        assert len(clip) == min(round(seconds * rate), len(native.audio))
-        np.testing.assert_allclose(clip, native.audio[: len(clip)], atol=2**-23, rtol=0)
-        assert record["shorter_than_requested"] is bool(expected_code)
-        assert record["generation_truncated"] == {"abc": False, "semantic": False}

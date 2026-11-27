@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yue2-infer"
 version = "0.1.6"
-description = "YuE2 music generation with editable symbolic plans"
+description = "YuE2 command-line music inference"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -29,8 +29,8 @@ fast = ["vllm==0.19.0; sys_platform == 'linux'", "triton==3.6.0; sys_platform ==
 test = ["pytest==9.0.3"]
 
 [project.urls]
-Repository = "https://github.com/multimodal-art-projection/YuE"
-Demo = "https://map-yue2.github.io/"
+Repository = "https://github.com/hanruijiang/YuE"
+Upstream = "https://github.com/multimodal-art-projection/YuE"
 Models = "https://huggingface.co/m-a-p/YuE2-3B"
 
 [project.scripts]
