@@ -132,7 +132,13 @@ def model_identity(path, verify=True):
         entries[file.name] = {"sha256": digest, "bytes": file.stat().st_size}
     if expected is not None and set(entries) != set(expected.get("files", {})):
         raise ValueError("Weight manifest has missing or unexpected shards")
-    return {"files": entries, "config_sha256": sha256_file(path / "config.json")}
+    result = {"files": entries, "config_sha256": sha256_file(path / "config.json")}
+    # Keep the weight-manifest schema unchanged; these files also affect inference.
+    for name, key in (("qwen.tiktoken", "tokenizer_sha256"),
+                      ("model.safetensors.index.json", "index_sha256")):
+        if (path / name).is_file():
+            result[key] = sha256_file(path / name)
+    return result
 
 
 def collect_hashes(directory, exclude=("result.json",)):

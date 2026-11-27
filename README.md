@@ -18,7 +18,7 @@ python -m pip install .
 yue2 doctor
 ```
 
-On Windows, activate with `.venv\Scripts\activate`. Install the appropriate PyTorch build before installing the package. The runtime pins PyTorch 2.10.0 on non-macOS and 2.14.1 on macOS. For Intel XPU on Linux, use `uv sync --extra xpu` (mutually exclusive with `cuda` and `fast`). For NVIDIA vLLM acceleration on Linux, install `.[fast]` in a compatible environment and pass `--backend vllm`.
+On Windows, activate with `.venv\Scripts\activate`. Install the appropriate PyTorch build before installing the package. The runtime pins PyTorch 2.10.0 on non-macOS and 2.14.1 on macOS. For Intel XPU on Linux, use `uv sync --extra xpu` (mutually exclusive with `fast`). For NVIDIA vLLM acceleration on Linux, install `.[fast]` in a compatible environment and pass `--backend vllm`.
 
 ## Generate
 
@@ -34,7 +34,7 @@ The JSON request accepts `id`, `style` (or `tags`), `lyrics`, `cot`, `seed`, `cf
 - `--cot full`: melody and chords (default).
 - `--cot melody`: melody only.
 - `--cot off`: no symbolic plan.
-- `--stage plan`: generate and save the plan without synthesizing audio.
+- `--stage plan`: generate and save the plan without synthesizing audio or resolving VAE weights.
 
 ```bash
 yue2 generate --request examples/song.json --abc-file examples/melody.abc --cot melody --output runs/melody
@@ -67,7 +67,7 @@ yue2 export --output offline-pipeline
 yue2 generate --request examples/song.json --model offline-pipeline --offline --device cuda --output runs/offline
 ```
 
-`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes, not audio quality. `decode` loads only the VAE and accepts finite floating-point latent arrays in [T,C] or [1,C,T] layout. `export` prepares a portable local pipeline for offline inference. Existing nonempty output directories are refused unless the command supports verified resume.
+`validate` checks request inputs before loading models. `inspect` verifies saved artifact hashes, not audio quality. `decode` loads only the VAE and accepts finite floating-point latent arrays in [T,C] or [1,C,T] layout. `export` prepares a portable local pipeline for offline inference without selecting a device or loading model tensors. `doctor` checks the eight required package metadata entries and reports available devices; it does not accept generation-specific options or validate optional backends. Existing nonempty output directories are refused unless the command supports verified resume.
 
 ## Devices and memory
 
@@ -77,7 +77,7 @@ The default `--device auto` selects CUDA/ROCm, MPS, XPU, then CPU. Explicit devi
 yue2 generate --request examples/song.json --device cuda --low-vram --budget 8 --output runs/low-memory
 ```
 
-`--low-vram` uses host memory to keep only active AR/NAR weights on the accelerator; long sequences can still exhaust device memory. `--quantization fp8` is optional on supported NVIDIA hardware. Use `--backend torch-eager` for eager execution. `--quiet` hides progress on stderr. Run `yue2 generate --help` or `yue2 --help` for all options.
+`--low-vram` uses host memory to keep only active AR/NAR weights on the accelerator; long sequences can still exhaust device memory. `--quantization fp8` is optional on supported NVIDIA hardware. Use `--backend torch-eager` for eager execution without CUDA/XPU graphs or `torch.compile`, even when `YUE2_COMPILE` is set. `--quiet` hides progress on stderr. Run `yue2 generate --help` or `yue2 --help` for all options.
 
 ## Tests
 

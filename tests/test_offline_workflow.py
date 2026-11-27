@@ -161,20 +161,17 @@ def test_real_batch_preflight_resume_and_relocated_export(offline_models, tmp_pa
     )
     source = tmp_path / "batch.jsonl"
     source.write_text("\n".join(map(json.dumps, [dict(request, id="invalid", seed=-1), request])))
-    flags = [
+    export_flags = [
         "--model",
         model,
         "--vae",
         vae,
         "--config",
         settings,
-        "--device",
-        "cpu",
-        "--backend",
-        "torch-eager",
         "--offline",
         "--quiet",
     ]
+    flags = [*export_flags, "--device", "cpu", "--backend", "torch-eager"]
     report = cli("validate", "--input", source, "--config", settings, returncode=1)
     assert [row["ok"] for row in report["results"]] == [False, True]
     runs = tmp_path / "runs"
@@ -192,7 +189,7 @@ def test_real_batch_preflight_resume_and_relocated_export(offline_models, tmp_pa
     cli("batch", "--input", source, "--output", runs, "--resume", *flags)
     assert before == {p.name: sha256_file(p) for p in directory.iterdir() if p.is_file()}
     exported = tmp_path / "exported"
-    cli("export", "--output", exported, *flags)
+    cli("export", "--output", exported, *export_flags)
     relocated = tmp_path / "relocated"
     exported.rename(relocated)
     # The saved pipeline supplies model/VAE paths and generation defaults offline.

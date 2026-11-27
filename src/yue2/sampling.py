@@ -87,7 +87,7 @@ def _graph_enabled(model, device, requested):
 
 @torch.inference_mode()
 def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_scale=1.0,
-                    legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True):
+                    legacy_off=False, cancelled=None, on_token=None, use_cuda_graph=True, use_compile=True):
     from .modeling_yue2 import StaticKVCache
     device = model.model.embed_tokens.weight.device
     dtype = model.model.embed_tokens.weight.dtype
@@ -116,7 +116,7 @@ def generate_tokens(model, prefix, sampling, seed, phase, negative=None, cfg_sca
     graph = None
     positive_cache = negative_cache = None
     graph_enabled = _graph_enabled(model, device, use_cuda_graph)
-    decode_step = _ensure_decode_step(model) if _compile_enabled() and not graph_enabled else None
+    decode_step = _ensure_decode_step(model) if use_compile and _compile_enabled() and not graph_enabled else None
     synchronize(device)
     start = time.perf_counter()
     try:

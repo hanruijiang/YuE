@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 from .storage import write_json, verify_result, identity
-from .protocol import GenerationConfig, SongRequest, preflight
+from .protocol import GenerationConfig, SongRequest, make_request, preflight
 
 
 def kit_root():
@@ -34,7 +34,8 @@ def get_pipe(args):
              backend=args.backend, quantization=args.quantization, offload_ar=args.offload_ar, low_vram=args.low_vram,
              local_files_only=args.offline, generation_config=config,
              vae_core_frames=512 if args.budget <= 12 else 1024,
-             progress=not getattr(args, "quiet", False))
+             progress=not getattr(args, "quiet", False),
+             defer_vae=getattr(args, "stage", None) == "plan")
 
 
 def generation_config(args):
@@ -92,9 +93,8 @@ def request_kwargs(data, base=None):
             raise ValueError("Pass abc or abc_path, not both")
         result["abc"] = (base / data["abc_path"]).read_bytes().decode("utf-8")
     if data.get("prompt") is not None:
-        from .protocol import SongRequest
-        request = SongRequest(style=result.get("style", result.get("tags")), lyrics=result["lyrics"],
-                              cot=result.get("cot", "full"))
+        request = make_request(style=result.get("style"), tags=result.get("tags"),
+                               lyrics=result.get("lyrics"), cot=result.get("cot", "full"))
         if data["prompt"] != request.text():
             raise ValueError("Historical literal prompt does not match native instruction/style/lyrics")
     return result
@@ -105,8 +105,11 @@ def export_models(args):
     directory = Path(args.output)
     if directory.exists() and any(directory.iterdir()):
         raise FileExistsError("Export needs an empty output directory")
-    with closing(get_pipe(args)) as pipe:
-        pipe.save_pretrained(directory)
+    from .pipeline import export_pipeline
+    model, vae = model_paths(args)
+    export_pipeline(directory, model, vae=vae, revision=args.revision,
+                    vae_revision=args.vae_revision, local_files_only=args.offline,
+                    generation_config=generation_config(args), progress=not args.quiet)
     print(json.dumps({"exported": True, "pipeline": str(directory / "pipeline.json")}))
     return 0
 
@@ -182,7 +185,8 @@ def doctor(args):
     from .storage import model_identity
     model, vae = model_paths(args)
     versions = {}
-    for package in ("torch", "transformers", "huggingface-hub", "safetensors", "tiktoken", "soundfile"):
+    for package in ("torch", "transformers", "huggingface-hub", "safetensors", "tiktoken",
+                    "numpy", "soundfile", "accelerate"):
         try:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -232,7 +236,7 @@ def generate(args):
     request = preflight(kwargs, generation_config(args))
     with closing(get_pipe(args)) as pipe:
         directory = Path(args.output or "runs/default") / kwargs.get("id", "song")
-        if args.resume and (directory / "result.json").exists():
+        if args.stage != "plan" and args.resume and (directory / "result.json").exists():
             config = pipe.effective_config(request, kwargs.get("abc_sampling"), kwargs.get("semantic_sampling"))
             expected = identity({"request": request.to_dict(), "config": config, "weights": pipe.weights})
             result = verify_result(directory, expected)
@@ -316,14 +320,16 @@ def parser():
         q.add_argument("--vae", default="standard", help="standard (listening), legacy (paper evaluation), local path or HF repo")
         q.add_argument("--revision")
         q.add_argument("--vae-revision")
-        q.add_argument("--device", default="auto")
-        q.add_argument("--budget", type=float, default=24)
-        q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
-        q.add_argument("--quantization", choices=("none", "fp8"), default="none")
-        q.add_argument("--offload-ar", action="store_true")
-        q.add_argument("--low-vram", action="store_true", help="Keep only the active AR or NAR modules on the accelerator")
+        if name in ("generate", "batch"):
+            q.add_argument("--device", default="auto")
+            q.add_argument("--budget", type=float, default=24)
+            q.add_argument("--backend", choices=("torch", "torch-eager", "vllm"), default="torch")
+            q.add_argument("--quantization", choices=("none", "fp8"), default="none")
+            q.add_argument("--offload-ar", action="store_true")
+            q.add_argument("--low-vram", action="store_true", help="Keep only the active AR or NAR modules on the accelerator")
         q.add_argument("--offline", action="store_true")
-        q.add_argument("--config")
+        if name != "doctor":
+            q.add_argument("--config")
         q.add_argument("--output", required=name == "export")
         if name == "export":
             q.add_argument("--quiet", "--no-progress", action="store_true")

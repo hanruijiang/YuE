@@ -17,12 +17,6 @@ from torch.nn.utils import weight_norm
 from transformers import PretrainedConfig, PreTrainedModel
 
 
-def checkpoint(function, *args, **kwargs):
-    from torch.utils.checkpoint import checkpoint as torch_checkpoint
-    kwargs.setdefault("use_reentrant", False)
-    return torch_checkpoint(function, *args, **kwargs)
-
-
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
 
@@ -102,12 +96,7 @@ class ResidualUnit(nn.Module):
         )
 
     def forward(self, x):
-        residual = x
-        if self.training:
-            x = checkpoint(self.layers, x)
-        else:
-            x = self.layers(x)
-        return x + residual
+        return self.layers(x) + x
 
 
 class EncoderBlock(nn.Module):

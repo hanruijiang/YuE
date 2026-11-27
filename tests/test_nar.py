@@ -26,12 +26,112 @@ def model():
     torch.set_num_threads(previous_threads)
 
 
+def _shift_t_value(model, t_value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    t_sig = torch.sigmoid(torch.tensor(t_value, dtype=dtype, device=device))
+    shift = model.config.timestep_shift
+    return shift * t_sig / (1 + (shift - 1) * t_sig)
+
+@torch.no_grad()
+def _dense_nar_velocity(
+    model,
+    tokens: torch.LongTensor,
+    ar_mask: torch.BoolTensor,
+    nar_mask: torch.BoolTensor,
+    nar_content_mask: torch.BoolTensor,
+    x_t: torch.Tensor,
+    t_value: float,
+    nar_cond_end: int = 0,
+) -> torch.Tensor:
+    """Compute v_theta(x_t, t) — flow-matching velocity field.
+
+    Args:
+        tokens: [1, S] full sequence (AR + NAR tokens)
+        ar_mask: [1, S] True for AR positions
+        nar_mask: [1, S] True for NAR positions
+        nar_content_mask: [1, S] True for actual latent positions (not LATENT_START/END)
+        x_t: [T_lat, D] current ODE state
+        t_value: raw timestep (will be sigmoid-shifted)
+        nar_cond_end: if > 0, NAR only sees positions < nar_cond_end (text-only mode)
+    Returns:
+        v_pred: [T_lat, D] predicted velocity
+    """
+    device = tokens.device
+    dtype = next(model.parameters()).dtype
+    B, S = tokens.shape
+
+    # 1. Token embeddings
+    token_emb = model.model.embed_tokens(tokens)  # [B, S, H]
+
+    # 2. Build latent hidden for ALL NAR positions (START + content + END)
+    # Training injects vae2llm(x_t) + time_emb + pos_emb at ALL NAR positions,
+    # including LATENT_START (clean=0) and LATENT_END (clean=0).
+    # NAR position IDs via cumsum: START=0, content=[1..T_lat], END=T_lat+1.
+    t_shifted = _shift_t_value(model, t_value, device, dtype)
+    T_lat = x_t.shape[0]
+
+    nar_indices = nar_mask[0].nonzero(as_tuple=True)[0]  # all NAR positions
+    content_indices = nar_content_mask[0].nonzero(as_tuple=True)[0]
+    N_nar = nar_indices.shape[0]  # START + T_lat + END
+
+    # Build x_t for all NAR positions: zeros for START/END, actual x_t for content
+    x_nar = torch.zeros(N_nar, x_t.shape[1], device=device, dtype=dtype)
+    x_nar[1:1 + T_lat] = x_t.to(dtype)  # content frames at positions [1, T_lat]
+
+    latent_hidden_nar = model.vae2llm(x_nar.unsqueeze(0))  # [1, N_nar, H]
+
+    # Timestep embedding (same t for all NAR positions)
+    time_emb = model.time_embedder(t_shifted.expand(N_nar)).unsqueeze(0)
+    latent_hidden_nar = latent_hidden_nar + time_emb
+
+    # Position embedding: cumsum-style [0, 1, 2, ..., N_nar-1]
+    pos_ids = torch.arange(N_nar, device=device).clamp(max=model.config.max_latent_frames - 1)
+    pos_emb = model.latent_pos_embed(pos_ids).unsqueeze(0)
+    latent_hidden_nar = latent_hidden_nar + pos_emb
+
+    # Inject at ALL NAR positions (matching training's torch.where)
+    token_emb[0, nar_indices] = latent_hidden_nar[0]
+
+    # 3. Build hybrid attention mask [B, 1, S, S]
+    # AR→AR: causal, NAR→AR: full, NAR→NAR: bidirectional, AR→NAR: blocked
+    ar_q = ar_mask.unsqueeze(2).float()   # [B, S, 1]
+    ar_k = ar_mask.unsqueeze(1).float()   # [B, 1, S]
+    nar_q = nar_mask.unsqueeze(2).float()
+    nar_k = nar_mask.unsqueeze(1).float()
+    causal = torch.tril(torch.ones(S, S, device=device))
+
+    if nar_cond_end > 0:
+        # Codec dropout: NAR only sees positions < nar_cond_end (text) + NAR
+        text_k = torch.zeros(1, 1, S, device=device)
+        text_k[0, 0, :nar_cond_end] = 1.0
+        mask = (ar_q * ar_k * causal) + (nar_q * text_k) + (nar_q * nar_k)
+    else:
+        mask = (ar_q * ar_k * causal) + (nar_q * ar_k) + (nar_q * nar_k)
+    # Convert to additive: 0 → attend, -inf → block
+    attn_mask = mask.unsqueeze(1)  # [B, 1, S, S]
+    attn_mask = attn_mask.masked_fill(attn_mask == 0, float("-inf")).masked_fill(attn_mask > 0, 0.0)
+
+    # 4. Position IDs + RoPE
+    position_ids = torch.arange(S, device=device).unsqueeze(0)
+
+    # 5. Forward through decoder (with MoT routing)
+    ar_mask_bt = ar_mask  # [B, S] bool for MoT routing
+    hidden_states, _ = model.model(
+        inputs_embeds=token_emb, position_ids=position_ids,
+        use_cache=False, attention_mask=attn_mask, ar_mask=ar_mask_bt,
+    )
+
+    # 6. NAR head at content positions
+    nar_pred = model.llm2vae(hidden_states)  # [B, S, D]
+    v_pred = nar_pred[0, content_indices]  # [T_lat, D]
+    return v_pred
+
+
 def dense_velocity(model, chunk, state, raw_t):
     ar_length, total = len(chunk.ar_tokens), len(chunk.ar_tokens) + len(state) + 2
     tokens = torch.tensor([chunk.ar_tokens + [0] * (len(state) + 2)])
     ar_mask = torch.arange(total)[None] < ar_length
     content_mask = (torch.arange(total)[None] > ar_length) & (torch.arange(total)[None] < total - 1)
-    return model.nar_velocity(tokens, ar_mask, ~ar_mask, content_mask, state, raw_t,
+    return _dense_nar_velocity(model, tokens, ar_mask, ~ar_mask, content_mask, state, raw_t,
                               nar_cond_end=chunk.nar_cond_end)
 
 
