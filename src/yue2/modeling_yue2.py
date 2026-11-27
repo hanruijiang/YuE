@@ -534,6 +534,11 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
+    def _shift_t_value(self, t_value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        t_sig = torch.sigmoid(torch.tensor(t_value, dtype=dtype, device=device))
+        shift = self.config.timestep_shift
+        return shift * t_sig / (1 + (shift - 1) * t_sig)
+
     # ── AR forward (standard causal LM, KV cached) ───────────────────
 
     def forward(
